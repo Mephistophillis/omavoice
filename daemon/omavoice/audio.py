@@ -763,6 +763,7 @@ class Speaker:
         self.on_level = on_level
         # Set per session by the daemon; empty means the system default.
         self.target = cfg.output_target
+        self.verify_target: Callable[[str], Awaitable[bool]] | None = None
         self._bands = BandAnalyser(cfg.sample_rate)
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -782,6 +783,22 @@ class Speaker:
         return max(0.0, self._play_until - asyncio.get_running_loop().time())
 
     async def _spawn(self) -> asyncio.subprocess.Process:
+        # pw-play silently falls back when a requested sink disappears. Make
+        # that fallback explicit before any PCM is written, so a vanished AEC
+        # or headphone sink cannot keep the microphone's full-duplex exemption.
+        if self.target and self.verify_target is not None:
+            try:
+                present = await self.verify_target(self.target)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not verify speaker %r: %s", self.target, exc)
+                present = False
+            if not present:
+                log.warning(
+                    "speaker %r is unavailable — using the system default; "
+                    "microphone suppressed during playback",
+                    self.target,
+                )
+                self.target = ""
         # A missing or untrusted setpriv/pw-play raises OSError from here, which
         # is what callers of a subprocess spawn already expect.
         argv = [*_pdeathsig_argv("pw-play"), *_pw_common(self.cfg)]
@@ -811,6 +828,12 @@ class Speaker:
             assert stdin
             try:
                 stdin.write(pcm)
+                # write() has handed bytes to the player even if drain() is
+                # still waiting for capacity. Start the playback clock now:
+                # waiting until drain returned left audible speech unguarded.
+                now = asyncio.get_running_loop().time()
+                seconds = len(pcm) / (self.cfg.sample_rate * self.cfg.channels * 2)
+                self._play_until = max(self._play_until, now) + seconds
                 await asyncio.wait_for(stdin.drain(), timeout=self.WRITE_TIMEOUT)
             except asyncio.TimeoutError:
                 log.warning(
@@ -818,6 +841,7 @@ class Speaker:
                 )
                 dead, self._proc = self._proc, None
                 await terminate_and_reap(dead, grace=self.STOP_GRACE)
+                self._play_until = 0.0
                 return
             except (BrokenPipeError, ConnectionResetError):
                 # pw-play went away (device switch, suspend). Next write respawns it.
@@ -827,11 +851,8 @@ class Speaker:
                 # used to be dropped on the floor, one abandoned player per
                 # device switch, each still attached to a sink.
                 await terminate_and_reap(dead, grace=self.STOP_GRACE)
+                self._play_until = 0.0
                 return
-
-            now = asyncio.get_running_loop().time()
-            seconds = len(pcm) / (self.cfg.sample_rate * self.cfg.channels * 2)
-            self._play_until = max(self._play_until, now) + seconds
         if self.on_level:
             self.on_level(rms_level(pcm), self._bands.push(pcm))
 

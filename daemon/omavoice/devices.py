@@ -18,11 +18,12 @@ using, and the echo canceller is switched in or out with it:
                 the canceller's noise suppression, which costs signal, is pure
                 loss here. Use the plain default devices.
 
-Whether headphones are on is read from the sink the system chose: a Bluetooth
-audio sink is worn by definition, and a wired one announces itself in the name
-of its active port. Anything unrecognised is assumed to be a speaker, because
-that assumption is the safe one — an unnecessary canceller costs a little
-signal, while a missing one makes the assistant talk to itself.
+Whether headphones are on is read from the sink the system chose: its active
+port, form factor and icon are independent pieces of evidence. Bluetooth alone
+is not evidence — speakers, soundbars and car audio use the same BlueZ sink
+names as headphones. Anything unrecognised is assumed to put sound into the
+room, because an unnecessary canceller costs a little signal, while a missing
+one makes the assistant talk to itself.
 """
 
 from __future__ import annotations
@@ -43,7 +44,9 @@ log = logging.getLogger(__name__)
 AEC_SOURCE = "echo-cancel-source"
 AEC_SINK = "omavoice_playback"
 
-_HEADPHONE_HINTS = ("headphone", "headset", "hands-free", "handsfree")
+_WORN_HINTS = ("headphone", "headset", "earbud")
+_WORN_FORM_FACTORS = frozenset(("headphone", "headset"))
+_OPEN_PORT_HINTS = ("speaker", "handsfree", "hands-free", "car", "tv")
 
 
 @dataclass(frozen=True)
@@ -61,9 +64,21 @@ class Devices:
     # opening it is what asks for the switch — so the first attempt can lose
     # that race, and a device can also disappear mid-session.
     fallback_input: str = ""
+    # Full duplex on speakers is safe only when both live AEC nodes form the
+    # actual route. A node name or a warning alone is not echo protection.
+    echo_cancelled: bool = False
 
     def describe(self) -> str:
         return f"in={self.input_target} out={self.output_target} ({self.reason})"
+
+
+@dataclass(frozen=True)
+class _SinkFacts:
+    """The small, semantic part of a verbose `pactl list sinks` entry."""
+
+    port: str = ""
+    form_factor: str = ""
+    icon_name: str = ""
 
 
 def short_label(name: str, description: str) -> str:
@@ -266,29 +281,78 @@ async def _default_source() -> str:
     return await _pactl("get-default-source")
 
 
-async def _active_port_of(sink: str) -> str:
-    """The port a sink is currently using, lowercased. Empty when unknown."""
+async def _sink_facts(sink: str) -> _SinkFacts:
+    """Read the evidence that says whether output stays out of the room.
+
+    PipeWire's native spelling uses hyphens while its PulseAudio compatibility
+    layer commonly prints underscores. Accept both; a hardware-dependent
+    spelling difference must never disable echo protection.
+    """
     if not sink:
-        return ""
+        return _SinkFacts()
     text = await _pactl("list", "sinks")
     current = ""
+    port = ""
+    properties: dict[str, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("Name: "):
             current = stripped[6:]
-        elif current == sink and stripped.startswith("Active Port: "):
-            return stripped[13:].lower()
-    return ""
+            continue
+        if current != sink:
+            continue
+        if stripped.startswith("Active Port: "):
+            port = stripped[13:].strip().lower()
+            continue
+        match = re.fullmatch(r"([a-zA-Z0-9_.-]+)\s*=\s*(.*)", stripped)
+        if not match:
+            continue
+        key, value = match.groups()
+        key = key.replace("_", "-").lower()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        properties[key] = value.strip().lower()
+    return _SinkFacts(
+        port=port,
+        form_factor=properties.get("device.form-factor", ""),
+        icon_name=properties.get("device.icon-name", ""),
+    )
 
 
-def _is_worn(sink: str, port: str) -> tuple[bool, str]:
-    """Does sound from this sink stay out of the room?"""
+def _is_worn(sink: str, facts: _SinkFacts) -> tuple[bool, str]:
+    """Does sound from this sink stay out of the room?
+
+    A positive answer needs explicit headphone evidence. `hands-free` is not
+    enough: speakerphones and car kits expose that form factor too. A known
+    non-headphone form factor wins over an icon, because it describes the
+    physical device while icons are presentation hints and can be stale.
+    """
+    # Some Bluetooth profiles call their port `headset-output-handsfree` even
+    # when the hardware is a speakerphone. The open-room word wins; the more
+    # generic `headset` substring must not grant an echo-protection exemption.
+    for hint in _OPEN_PORT_HINTS:
+        if hint in facts.port:
+            return False, f"open-output sink port {facts.port!r}"
+
+    for hint in _WORN_HINTS:
+        if hint in facts.port:
+            return True, f"sink port {facts.port!r}"
+
+    if facts.form_factor:
+        if facts.form_factor in _WORN_FORM_FACTORS:
+            return True, f"device form factor {facts.form_factor!r}"
+        return False, f"device form factor {facts.form_factor!r}"
+
+    for hint in _WORN_HINTS:
+        if hint in facts.icon_name:
+            return True, f"device icon {facts.icon_name!r}"
+
     if sink.startswith("bluez_output"):
-        return True, "bluetooth sink, treated as worn"
-    for hint in _HEADPHONE_HINTS:
-        if hint in port:
-            return True, f"sink port {port!r}"
-    return False, f"sink port {port!r}" if port else "no port reported"
+        return False, "bluetooth output without headphone evidence"
+    if facts.port:
+        return False, f"sink port {facts.port!r}"
+    return False, "no headphone evidence reported"
 
 
 async def node_exists(name: str) -> bool:
@@ -356,8 +420,9 @@ async def resolve(
 ) -> Devices:
     """Pick devices for one session.
 
-    An explicit `OMAVOICE_INPUT` / `OMAVOICE_OUTPUT` always wins: someone who
-    named a device meant it. Everything else is decided here.
+    An explicit, present `OMAVOICE_INPUT` / `OMAVOICE_OUTPUT` wins: someone who
+    named a device meant it. Routes that bypass AEC still need microphone
+    suppression during speaker playback; their metadata makes that explicit.
 
     `avoid` holds microphones that already failed to produce audio while this
     daemon has been running. A Bluetooth headset whose HFP transport is broken
@@ -377,18 +442,19 @@ async def resolve(
         )
         configured_input = ""
 
-    if configured_input and configured_output:
-        return Devices(
-            configured_input,
+    if configured_output and not await node_exists(configured_output):
+        log.warning(
+            "the chosen output %r is not present — falling back to the system "
+            "output and checking its echo protection",
             configured_output,
-            False,
-            "set explicitly",
-            f"{await _describe_source(configured_input)} · chosen by hand",
         )
+        configured_output = ""
 
-    sink = await _default_sink()
-    port = await _active_port_of(sink)
-    worn, why = _is_worn(sink, port)
+    # Classify what will play, not an unrelated system default. Otherwise an
+    # explicit speaker output can inherit the default headphones' exemption.
+    sink = configured_output or await _default_sink()
+    facts = await _sink_facts(sink)
+    worn, why = _is_worn(sink, facts)
 
     if worn:
         own_mic = await _headset_mic_for(sink)
@@ -407,18 +473,19 @@ async def resolve(
             await _default_source(),
         )
 
-    # Speakers. The canceller is only useful if it is actually loaded; without
-    # the PipeWire config in place its nodes do not exist, and pointing at them
-    # would leave the session deaf.
-    if await node_exists(AEC_SOURCE):
+    # An orphan source does not establish a reference path. pw-play can fall
+    # back to the physical default when its target is missing, so verify both.
+    source_exists, sink_exists = await asyncio.gather(
+        node_exists(AEC_SOURCE), node_exists(AEC_SINK)
+    )
+    aec_ready = source_exists and sink_exists
+    fallback = ""
+    if configured_input and configured_output:
+        chosen, output = configured_input, configured_output
+        detail = "explicit route does not form the echo canceller pair"
+    elif aec_ready and (not configured_output or configured_output == AEC_SINK):
         chosen = configured_input or AEC_SOURCE
         if chosen != AEC_SOURCE:
-            # The one combination that cannot work, and the one that is easy to
-            # assemble by accident: playing into the canceller's sink while
-            # recording straight off a device. The canceller dutifully subtracts
-            # the echo — into its own source, which nobody is listening to — and
-            # the assistant answers its own last sentence. It has to be both
-            # ends or neither.
             default = await _default_source()
             if chosen == default:
                 log.info(
@@ -428,50 +495,45 @@ async def resolve(
                 )
                 chosen = AEC_SOURCE
             else:
-                log.warning(
-                    "%s is not the microphone the echo canceller captures (%s), so "
-                    "cancellation cannot cover it — playing to the plain sink "
-                    "instead. Expect the assistant to hear itself on speakers.",
-                    chosen,
-                    default or "none",
-                )
-                return Devices(
-                    chosen,
-                    configured_output or sink,
-                    False,
-                    f"speakers — {why}, chosen microphone is outside the canceller",
-                    f"{await _describe_source(chosen)} · echo cancellation unavailable",
-                    AEC_SOURCE,
-                )
+                fallback = AEC_SOURCE
+        output = AEC_SINK if chosen == AEC_SOURCE else sink
+        detail = "chosen microphone is outside the canceller"
+    else:
+        chosen = configured_input or await _default_source()
+        output = sink
+        detail = (
+            "echo canceller source/sink pair is not loaded"
+            if not aec_ready
+            else "chosen output bypasses the echo canceller"
+        )
+
+    echo_cancelled = aec_ready and chosen == AEC_SOURCE and output == AEC_SINK
+    if echo_cancelled:
         return Devices(
             chosen,
-            configured_output or AEC_SINK,
+            output,
             False,
             f"speakers — {why}, routed through the echo canceller",
             "Speakers · echo cancellation on",
-            # No fallback, deliberately. On speakers the canceller's source is
-            # the only correct input, because playback goes through its sink:
-            # swapping the microphone alone leaves the physical one hearing
-            # uncancelled speaker output, which is precisely the mismatched
-            # pair that makes the assistant answer its own last sentence. A
-            # session that says it cannot hear is a worse afternoon than one
-            # that talks to itself is an evening.
-            "",
+            # Switching just the input would break the verified pair.
+            fallback_input="",
+            echo_cancelled=True,
         )
 
-    source = await _default_source()
     log.warning(
-        "%s is not loaded — running without echo cancellation, so the assistant "
-        "may hear itself through the speakers",
-        AEC_SOURCE,
+        "%s — using half duplex: microphone suppressed during playback; "
+        "voice interruption unavailable (in=%s out=%s)",
+        detail,
+        chosen,
+        output,
     )
-    chosen = configured_input or source
     return Devices(
         chosen,
-        configured_output or sink,
+        output,
         False,
-        "speakers, but no echo canceller is loaded",
-        f"{await _describe_source(chosen)} · no echo cancellation",
+        f"speakers — {why}, {detail}; half duplex",
+        f"{await _describe_source(chosen)} · half duplex (voice interruption unavailable)",
+        fallback_input=fallback,
     )
 
 async def _describe_source(name: str) -> str:

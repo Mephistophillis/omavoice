@@ -169,6 +169,7 @@ class Daemon:
         # this near-certain.
         self._play_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._play_task: asyncio.Task | None = None
+        self._play_writing = False
 
         # What the agent is doing, while it is doing it. Not kept and not
         # replayed to a late-joining panel: it is a window onto a process that
@@ -427,7 +428,9 @@ class Daemon:
         # not to fold this stretch into its estimate of the room. The rest of
         # the time it uses — and updates — its own measured level.
         threshold = None
-        if self._room_is_loud():
+        room_is_loud = self._room_is_loud()
+        suppress_echo = room_is_loud and not self._allows_voice_interruption()
+        if room_is_loud:
             threshold = self.gate.opening_level * _SPEAKING_GATE_MULTIPLIER
 
         # Two questions, but only one of them decides when the gate opens. The
@@ -445,9 +448,17 @@ class Daemon:
         stands_out = level >= (
             threshold if threshold is not None else self.gate.opening_level
         )
-        passed = self.gate.step(
-            level, threshold, can_open=self.autogain.is_speech_after_gain(loudness)
-        )
+        if suppress_echo:
+            # A level threshold cannot distinguish a physical speaker from a
+            # person. Without a verified echo path, only silence is safe while
+            # we play. Reset hangover too, so a previously open gate cannot
+            # carry the assistant's last syllable into the next listening turn.
+            self.gate.reset()
+            passed = False
+        else:
+            passed = self.gate.step(
+                level, threshold, can_open=self.autogain.is_speech_after_gain(loudness)
+            )
         if self.cfg.debug:
             # The one number that settles "why did it not hear me": the level
             # the microphone actually delivered, against the threshold it had
@@ -458,7 +469,7 @@ class Daemon:
             self._level_chunks = getattr(self, "_level_chunks", 0) + 1
             if self._level_chunks * self.cfg.chunk_ms >= 1000:
                 log.debug(
-                    "mic: peak=%.4f clip=%d gain=%.1fx gate=%.4f floor=%.4f passed=%d/%d sent=%d",
+                    "mic: peak=%.4f clip=%d gain=%.1fx gate=%.4f floor=%.4f passed=%d/%d sent=%d echo_guard=%s",
                     self._peak_level,
                     self._clipped,
                     self.autogain.gain,
@@ -467,6 +478,7 @@ class Daemon:
                     self._passed_chunks,
                     self._level_chunks,
                     session.sent_events,
+                    suppress_echo,
                 )
                 self._peak_level = 0.0
                 self._clipped = 0
@@ -508,10 +520,29 @@ class Daemon:
             self._speech_chunks += 1
         self._check_deaf_server(session)
 
+    def _allows_voice_interruption(self) -> bool:
+        """Only a verified route may send microphone audio over our playback."""
+        route = self.devices
+        if route is None or self.speaker.target != route.output_target:
+            return False
+        if route.headphones:
+            return True
+        return (
+            route.echo_cancelled
+            and self.mic.target == route.input_target == device_choice.AEC_SOURCE
+            and self.speaker.target == device_choice.AEC_SINK
+        )
+
+    def _playback_active(self) -> bool:
+        # The queue may be empty while write() waits for pw-play to start or
+        # drain. That sound still belongs to this answer and needs protection.
+        return self._play_writing or not self._play_queue.empty() or self.speaker.playing
+
     def _room_is_loud(self) -> bool:
-        if self.speaker.playing:
-            self._quiet_after = (
-                asyncio.get_running_loop().time() + self.speaker.remaining + _ECHO_TAIL_SECONDS
+        if self._playback_active():
+            self._quiet_after = max(
+                self._quiet_after,
+                asyncio.get_running_loop().time() + self.speaker.remaining + _ECHO_TAIL_SECONDS,
             )
             return True
         return asyncio.get_running_loop().time() < self._quiet_after
@@ -529,7 +560,7 @@ class Daemon:
                 await asyncio.sleep(_LEVEL_INTERVAL)
 
                 # The one place that knows the answer has stopped being heard.
-                if self.state == "speaking" and self.session and not self.speaker.playing:
+                if self.state == "speaking" and self.session and not self._playback_active():
                     self._set_state("listening")
 
                 self.server.broadcast(
@@ -563,7 +594,16 @@ class Daemon:
             while True:
                 pcm = await self._play_queue.get()
                 if pcm:
-                    await self.speaker.write(pcm)
+                    self._play_writing = True
+                    try:
+                        await self.speaker.write(pcm)
+                    finally:
+                        self._play_writing = False
+                        self._quiet_after = max(
+                            self._quiet_after,
+                            asyncio.get_running_loop().time()
+                            + self.speaker.remaining + _ECHO_TAIL_SECONDS,
+                        )
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001
@@ -576,6 +616,16 @@ class Daemon:
                 self._play_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    async def _flush_playback(self) -> None:
+        """Discard buffered speech while protecting its actual acoustic tail."""
+        was_loud = self._room_is_loud()
+        self._drop_queued_audio()
+        await self.speaker.flush_now()
+        # Discarded seconds are no longer audible, but killing a process does
+        # not remove sound already travelling through the room and microphone.
+        if was_loud:
+            self._quiet_after = asyncio.get_running_loop().time() + _ECHO_TAIL_SECONDS
 
     async def _on_tool_call(self, name: str, query: str) -> str:
         if name != "ask_agent":
@@ -691,9 +741,7 @@ class Daemon:
             # mid-sentence; anything less and it talks over the person.
             session = self.session
             if self.state == "speaking":
-                self._drop_queued_audio()
-                await self.speaker.flush_now()
-                self._quiet_after = 0.0
+                await self._flush_playback()
                 if session:
                     await session.cancel_response()
                 self._emit("barge", "interrupted")
@@ -778,15 +826,41 @@ class Daemon:
 
     # -- session lifecycle ---------------------------------------------------
 
+    async def _select_audio_devices(self) -> None:
+        """Refresh routing without relabelling a stream still on an old device."""
+        route = await device_choice.resolve(
+            self.cfg.input_target, self.cfg.output_target, avoid=self._bad_inputs
+        )
+        # New-conversation resets may keep audio processes alive. A target
+        # attribute does not move those existing processes, so stop a changed
+        # route before assigning names the echo guard relies on.
+        if self.mic.target != route.input_target:
+            await self.mic.stop()
+        if self.speaker.target != route.output_target:
+            await self._flush_playback()
+        self.devices = route
+        self.mic.target = route.input_target
+        self.mic.fallback_target = route.fallback_input
+        self.mic.on_fault = self._on_mic_fault
+        self.mic.verify_target = device_choice.node_exists
+        self.speaker.target = route.output_target
+        self.speaker.verify_target = device_choice.node_exists
+        log.info("audio: %s", route.describe())
+        asyncio.create_task(self._broadcast_audio()).add_done_callback(_log_task_failure)
+
     async def start_session(self) -> dict:
         if self.session is not None:
             if not self.paused:
                 return {"ok": True, "already": True}
-            # Back after a stop: the same conversation, listening again.
-            self.paused = False
+            # Back after a stop: the same conversation, on the devices that
+            # exist now. Headphones may have gone away, or AEC been restored.
+            # Keep incoming response audio paused until routing is ready.
+            await self._select_audio_devices()
             self.gate.reset()
             self.autogain.reset()
             await self.mic.start()
+            await self.speaker.start()
+            self.paused = False
             self._set_state("listening")
             self._emit("resume", "listening again")
             return {"ok": True, "resumed": True}
@@ -826,16 +900,7 @@ class Daemon:
         # so does the display they are competing with. `echo-cancel-source`
         # looks identical in every case, which is exactly why the substitution
         # used to be invisible — so say out loud what was chosen.
-        self.devices = await device_choice.resolve(
-            self.cfg.input_target, self.cfg.output_target, avoid=self._bad_inputs
-        )
-        log.info("audio: %s", self.devices.describe())
-        asyncio.create_task(self._broadcast_audio()).add_done_callback(_log_task_failure)
-        self.mic.target = self.devices.input_target
-        self.mic.fallback_target = self.devices.fallback_input
-        self.mic.on_fault = self._on_mic_fault
-        self.mic.verify_target = device_choice.node_exists
-        self.speaker.target = self.devices.output_target
+        await self._select_audio_devices()
 
         # Microphone first. On a Bluetooth headset, opening the microphone is
         # what asks WirePlumber to switch the card into its headset profile,
@@ -909,8 +974,7 @@ class Daemon:
         self.paused = True
         self.backgrounded = False
         await self.mic.stop()
-        self._drop_queued_audio()
-        await self.speaker.flush_now()
+        await self._flush_playback()
         # The agent, not only the audio. Stopping the sound while a question is
         # still being worked on meant the answer arrived a minute later and was
         # spoken into a room where somebody had pressed stop.
@@ -948,11 +1012,13 @@ class Daemon:
         play_task, self._play_task = self._play_task, None
         if play_task:
             play_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await play_task
         # Killing the player is how an answer in flight is cut off. When the
         # audio is being kept, do it only if something is actually playing —
         # otherwise a reset in silence would still suspend the canceller.
         if not keep_audio or self.speaker.playing:
-            await self.speaker.flush_now()
+            await self._flush_playback()
         if session:
             await session.close()
         # close() cancels and awaits the tool tasks, which is what ends the
@@ -1079,8 +1145,7 @@ class Daemon:
 
         if command == "cancel":
             # Shut the assistant up without ending the conversation.
-            self._drop_queued_audio()
-            await self.speaker.flush_now()
+            await self._flush_playback()
             if self.session:
                 # Before cancel_response, and before the brain: killing only the
                 # subprocess left the tool task alive to report "the agent

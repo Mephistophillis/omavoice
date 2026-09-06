@@ -106,16 +106,29 @@ Then three steps it deliberately does not do for you:
 
 ### Echo cancellation — the important part
 
-Without it the assistant hears its own voice through the speakers, takes that
-for your speech, and answers itself: it says goodbye to its own goodbye, then to
-that goodbye, and so on until you stop it. The config ships with the plugin and
-`setup.sh` installs it at
+Without it the microphone picks up the assistant's own voice through the
+speakers. Omavoice now suppresses microphone audio during unprotected speaker
+playback to prevent that voice becoming another user turn. Echo cancellation
+allows normal voice interruption while the assistant talks. The config ships
+with the plugin and `setup.sh` installs it at
 
 ```
 ~/.config/pipewire/pipewire.conf.d/99-omavoice-echo-cancel.conf
 ```
 
 Reload PipeWire once afterwards: `systemctl --user restart pipewire`.
+Then rerun setup to verify that both `echo-cancel-source` and
+`omavoice_playback` are loaded. Resuming a paused session checks its devices
+again, so a newly restored canceller or unplugged headphones update the route.
+
+Bluetooth is a transport, not a promise that the output is worn. Omavoice only
+skips echo protection when the active port, PipeWire form factor or device icon
+explicitly identifies headphones, a headset or earbuds. Bluetooth speakers,
+soundbars, car audio, hands-free devices and unknown BlueZ outputs take the
+speaker path: the complete AEC pair when it is available, otherwise protected
+half duplex. This is intentionally conservative across new computers and audio
+hardware — an unknown device may lose voice interruption during playback, but
+it cannot make the assistant answer its own voice.
 
 **Both ends have to go through the canceller.** It subtracts a reference signal
 from the microphone — precisely what went through *its own* sink. Listening on
@@ -158,10 +171,17 @@ Two more layers sit on top of the canceller, because one is not enough:
   Without that, echo slipped through exactly in the gap: two seconds after "How
   can I help?" the assistant would hear "Why can you help me?" and answer it.
 
-None of this stops you interrupting: live speech clears the threshold with room
-to spare and residual echo does not. If something still gets through, pin
-`OMAVOICE_GATE` to a number above what leaks; headphones remove the question
-entirely.
+Voice interruption remains enabled with headphones or a verified echo-cancel
+input/output pair. With missing or mismatched echo-cancel devices, speakers use
+protected turn-taking: microphone frames become silence from queued playback
+through the final sample and a 0.9 s echo tail. Speak after the answer finishes;
+`I` or `omavoice-ctl cancel` still interrupts immediately. Settings and logs
+identify this fallback as `half duplex`, and debug logs show `echo_guard=True`
+while input is suppressed. A previously open noise gate cannot bypass it.
+
+The playback guard also covers audio waiting in the application queue or in a
+blocked write to `pw-play`. Cancelling an answer keeps the short room-echo tail,
+without waiting for the discarded audio's original duration.
 
 When a conversation misbehaves, run the daemon with `OMAVOICE_DEBUG=1` and read
 one line per second:

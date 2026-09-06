@@ -130,6 +130,21 @@ else
   note "  diff $PW_CONF $PLUGIN_DIR/pipewire/99-omavoice-echo-cancel.conf"
 fi
 
+# A config on disk does not mean that the running server loaded it. Check
+# both ends even on repeat installs; a source without its reference sink
+# cannot cancel the assistant's voice.
+AEC_READY=false
+if command -v pactl >/dev/null \
+  && pactl list short sources | awk '$2 == "echo-cancel-source" { found=1 } END { exit !found }' \
+  && pactl list short sinks | awk '$2 == "omavoice_playback" { found=1 } END { exit !found }'; then
+  AEC_READY=true
+  note "both echo-cancellation nodes are loaded"
+else
+  note "echo cancellation is NOT active yet (one or both nodes are missing)."
+  note "Restart PipeWire, then rerun setup to verify: systemctl --user restart pipewire"
+  note "Until then, speakers use protected turn-taking: the microphone is suppressed during answers."
+fi
+
 # --- 5. Command line ---------------------------------------------------------
 say "omavoice-ctl"
 BIN_DIR="$HOME/.local/bin"
@@ -146,7 +161,10 @@ else
 fi
 
 # --- Next --------------------------------------------------------------------
-say "Done. Three things left, in this order:"
+say "Setup files installed. Next steps:"
+if [[ "$AEC_READY" != true ]]; then
+  note "First activate echo cancellation: systemctl --user restart pipewire"
+fi
 note "1. Put your key into $ENV_FILE"
 note "2. systemctl --user enable --now omavoice"
 note "3. Bind a key in ~/.config/hypr/bindings.lua:"
