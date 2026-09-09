@@ -117,6 +117,27 @@ class Config:
     api_key: str = field(default_factory=lambda: read_api_key())
     model: str = field(default_factory=lambda: os.environ.get("OMAVOICE_MODEL", "gpt-realtime-2.1-mini"))
     voice: str = field(default_factory=lambda: os.environ.get("OMAVOICE_VOICE", "marin"))
+
+    # --- local voice (fork) -------------------------------------------------
+    # voice_engine: "realtime" (OpenAI Realtime API, needs a key) or "local"
+    # (vosk ears + edge-tts mouth, no key, no network for the voice itself).
+    voice_engine: str = field(
+        default_factory=lambda: os.environ.get("OMAVOICE_VOICE_ENGINE", "local")
+    )
+    tts_voice: str = field(
+        default_factory=lambda: os.environ.get("OMAVOICE_TTS_VOICE", "ru-RU-DmitryNeural")
+    )
+    vosk_model: str = field(
+        default_factory=lambda: os.environ.get("OMAVOICE_VOSK_MODEL", "vosk-model-small-ru-0.22")
+    )
+
+    def vosk_model_dir(self) -> Path:
+        """Where the vosk model lives: $OMAVOICE_DATA/models/<name>."""
+        base = Path(os.environ.get("OMAVOICE_DATA")
+                    or (Path.home() / ".local" / "share" / "omavoice"))
+        return base / "models" / self.vosk_model
+
+
     transcription_model: str = field(
         default_factory=lambda: os.environ.get("OMAVOICE_TRANSCRIBE", "gpt-4o-transcribe")
     )
@@ -489,6 +510,11 @@ def _strip_key_from_env_file(dir_fd: int) -> None:
 
 def load() -> Config:
     cfg = Config()
+    # The local voice engine runs the whole pipeline at 16 kHz (vosk's native
+    # rate); every consumer — mic, speaker, gate, band analyser — reads this
+    # attribute, so setting it once here retunes them all.
+    if cfg.voice_engine == "local":
+        cfg.sample_rate = 16000
     try:
         # Opened here so the descriptor is held from startup, before anything
         # has had a chance to move the directory out from under us.

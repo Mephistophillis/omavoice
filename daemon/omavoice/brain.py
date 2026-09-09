@@ -34,6 +34,24 @@ from pathlib import Path
 
 from .config import ANSWER_SCHEMA, Config
 
+_HERMES_SYSTEM = """\
+You are the brain of a local voice assistant; your answer will be spoken \
+out loud by a text-to-speech voice and shown in a small desktop panel.
+
+Reply with STRICT JSON only, no markdown fences: \
+{"spoken": "...", "markdown": "...", "links": [{"label": "...", "url": "..."}], \
+"files": [{"label": "...", "path": "..."}]}
+
+- spoken: 1-3 short conversational sentences in the user's language. \
+This is what the voice says — no lists, no paths, no URLs read aloud.
+- markdown: optional fuller answer for the panel screen.
+- The person is talking to you by voice; keep every turn brief.
+- You are running on their machine with real tools — use them when the \
+question needs facts; answer from the conversation otherwise.
+"""
+
+_HERMES_TIMEOUT_S = 120
+
 log = logging.getLogger("omavoice.brain")
 
 # Phrasings that only make sense as a literal command to run, not as a
@@ -418,23 +436,23 @@ def _read_capped(path: Path, limit: int, what: str) -> str:
 class Brain:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.backend = cfg.backend if cfg.backend in ("codex", "claude") else "codex"
+        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes") else "codex"
         # One thread per backend, so flipping the switch mid-conversation does
         # not try to resume a codex thread inside claude.
         self._threads: dict[str, str] = {}
         self._job: _Job | None = None
-        # One agent at a time. The lock is what makes `_job` mean anything:
-        # with two invocations in flight it named only the later one, and
-        # cancelling stopped that one.
+        # The hermes backend keeps the dialog in-process instead (the gateway
+        # holds the session); keyed the same way for symmetry.
+        self._hermes_history: list[dict] = []
         self._lock = asyncio.Lock()
         self._on_trace: "Callable[[str], None] | None" = None
 
     # -- lifecycle ----------------------------------------------------------
 
     def set_backend(self, name: str) -> bool:
-        if name not in ("codex", "claude"):
+        if name not in ("codex", "claude", "hermes"):
             return False
-        if not shutil.which(name):
+        if name != "hermes" and not shutil.which(name):
             log.warning("backend %s is not installed", name)
             return False
         self.backend = name
@@ -443,6 +461,7 @@ class Brain:
     def reset(self) -> None:
         """Forget conversation history. A new panel session starts clean."""
         self._threads.clear()
+        self._hermes_history = [{"role": "system", "content": _HERMES_SYSTEM}]
 
     def watch(self, on_trace: "Callable[[str], None] | None") -> None:
         """Be told what the agent is doing while it is doing it.
@@ -556,7 +575,9 @@ class Brain:
             log.warning("refusing destructive-sounding request: %s", query[:120])
             return Answer.error(_REFUSAL)
 
-        if not shutil.which(self.backend):
+        if self.backend == "hermes":
+            pass  # no binary to check; the gateway is probed on first ask
+        elif not shutil.which(self.backend):
             return Answer.error(f"The {self.backend} agent is not installed.")
 
         denial = self.denial()
@@ -584,6 +605,8 @@ class Brain:
             try:
                 if self.backend == "codex":
                     return await self._ask_codex(query)
+                if self.backend == "hermes":
+                    return await self._ask_hermes(query)
                 return await self._ask_claude(query)
             except asyncio.TimeoutError:
                 # `_run` has already ended the group by the time this is
@@ -594,6 +617,69 @@ class Brain:
                 return Answer.error(f"The agent failed: {exc}")
 
     # -- backends -----------------------------------------------------------
+
+    async def _ask_hermes(self, query: str) -> Answer:
+        """Ask the local Hermes Agent gateway (OpenAI-compatible API server).
+
+        The gateway runs as a systemd user service with the person's own
+        Hermes configuration — provider, model, tools, skills. No subprocess,
+        no cold start: the agent is already warm on the other side of the
+        socket. History lives here, client-side; the gateway sees a fresh
+        session id derived from the first message (see api_server_openai_routes).
+        """
+        import urllib.request
+        import urllib.error
+
+        base = os.environ.get("OMAVOICE_HERMES_URL", "http://127.0.0.1:8642")
+        key = ""
+        key_file = Path.home() / ".hermes" / ".env"
+        if key_file.exists():
+            for line in key_file.read_text().splitlines():
+                if line.startswith("API_SERVER_KEY="):
+                    key = line.split("=", 1)[1].strip()
+                    break
+
+        self._hermes_history.append({"role": "user", "content": query})
+        body = json.dumps({"messages": self._hermes_history}).encode()
+        req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        self._trace(f"hermes: {query[:120]}")
+        try:
+            def _fetch() -> bytes:
+                with urllib.request.urlopen(req, timeout=_HERMES_TIMEOUT_S) as r:
+                    return r.read()
+
+            raw = await asyncio.to_thread(_fetch)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode(errors="replace")
+            self._hermes_history.pop()  # a failed turn is not context
+            return Answer.error(f"Hermes gateway error {exc.code}: {detail}")
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            self._hermes_history.pop()
+            log.warning("hermes gateway unreachable: %s", exc)
+            return Answer.error(
+                "The Hermes gateway is not reachable — is hermes-gateway running?"
+            )
+
+        try:
+            answer_text = json.loads(raw)["choices"][0]["message"]["content"] or ""
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            self._hermes_history.pop()
+            return Answer(spoken=_clip(raw.decode(errors="replace")[:_MAX_SPOKEN]))
+
+        self._hermes_history.append({"role": "assistant", "content": answer_text})
+        if len(self._hermes_history) > 16:
+            del self._hermes_history[1:3]  # keep system + bounded turns
+        answer = _coerce(answer_text)
+        self._trace(f"hermes: {answer.spoken[:120]}")
+        return answer
 
     async def _drain(
         self,

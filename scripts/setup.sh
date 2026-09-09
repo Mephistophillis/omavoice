@@ -67,6 +67,39 @@ else
 fi
 note "dependencies installed from $LOCK, digests verified"
 
+# --- 1b. vosk model (local voice) --------------------------------------------
+# The local voice engine needs a vosk model on disk. Downloaded once, checked
+# by size, unpacked under $XDG_DATA_HOME/omavoice/models/. The big model
+# (vosk-model-ru-0.42, 1.8 GB download / 3.5 GB unpacked) is markedly more
+# accurate for conversational Russian; the small one is a fast fallback.
+VOSK_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omavoice/models"
+VOSK_NAME="${OMAVOICE_VOSK_MODEL:-vosk-model-ru-0.42}"
+VOSK_URL_BASE="https://alphacephei.com/vosk/models"
+declare -A VOSK_ZIPS=( [vosk-model-ru-0.42]="$VOSK_URL_BASE/vosk-model-ru-0.42.zip"
+                       [vosk-model-small-ru-0.22]="$VOSK_URL_BASE/vosk-model-small-ru-0.22.zip" )
+
+say "vosk model"
+if [[ -d "$VOSK_DIR/$VOSK_NAME" ]]; then
+  note "$VOSK_NAME already at $VOSK_DIR/$VOSK_NAME"
+elif [[ -n "${VOSK_ZIPS[$VOSK_NAME]:-}" ]]; then
+  mkdir -p "$VOSK_DIR"
+  note "downloading $VOSK_NAME (this can take a while — the mirror is slow)"
+  if curl -fsSL --progress-bar -o "$VOSK_DIR/$VOSK_NAME.zip" "${VOSK_ZIPS[$VOSK_NAME]}" \
+     && unzip -q "$VOSK_DIR/$VOSK_NAME.zip" -d "$VOSK_DIR" \
+     && rm -f "$VOSK_DIR/$VOSK_NAME.zip" \
+     && [[ -d "$VOSK_DIR/$VOSK_NAME" ]]; then
+    note "installed $VOSK_DIR/$VOSK_NAME"
+  else
+    rm -f "$VOSK_DIR/$VOSK_NAME.zip"
+    echo "could not fetch $VOSK_NAME — the daemon will fail to start;" \
+         "rerun setup or place the model at $VOSK_DIR/$VOSK_NAME manually" >&2
+    exit 1
+  fi
+else
+  echo "unknown vosk model '$VOSK_NAME' — expected one of: ${!VOSK_ZIPS[*]}" >&2
+  exit 1
+fi
+
 # --- 2. systemd unit ---------------------------------------------------------
 # The PATH is captured from this shell rather than hardcoded: the daemon shells
 # out to codex or claude, and version managers keep those somewhere systemd's
@@ -110,6 +143,13 @@ else
   {
     echo '# Settings only. The API key lives in the file next to this one, which'
     echo '# systemd does not load into the environment.'
+    echo ''
+    echo '# Local voice engine (this fork): vosk ears + edge-tts mouth,'
+    echo '# hermes gateway brain. Set OMAVOICE_VOICE_ENGINE=realtime to go'
+    echo '# back to the OpenAI Realtime API (needs its paid key).'
+    echo 'OMAVOICE_VOICE_ENGINE=local'
+    echo 'OMAVOICE_BACKEND=hermes'
+    echo "OMAVOICE_VOSK_MODEL=$VOSK_NAME"
   } >> "$ENV_FILE"
 fi
 

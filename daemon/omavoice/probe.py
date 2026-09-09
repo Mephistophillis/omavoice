@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
     cfg = config.load()
-    if not cfg.api_key:
+    if cfg.voice_engine != "local" and not cfg.api_key:
         print("No OpenAI API key — see ~/.config/omavoice/env", file=sys.stderr)
         return 1
     if not args.file.exists():

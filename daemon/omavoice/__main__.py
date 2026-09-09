@@ -41,6 +41,7 @@ from .audio import (
 from .brain import Brain
 from .config import Config
 from .realtime import RealtimeSession
+from .localvoice import LocalVoiceSession
 
 log = logging.getLogger("omavoice")
 
@@ -158,7 +159,7 @@ class Daemon:
             hangover_ms=cfg.silence_ms + 300,
             chunk_ms=cfg.chunk_ms,
         )
-        self.session: RealtimeSession | None = None
+        self.session: "RealtimeSession | LocalVoiceSession | None" = None
 
         # Playback runs on its own task, fed by this queue. Writing to pw-play
         # directly from the socket-reading path meant that whenever the speaker
@@ -684,7 +685,7 @@ class Daemon:
     # conversations short before this was added.
     _DEAF_NEEDS_SPEECH_SECONDS = 10.0
 
-    def _check_deaf_server(self, session: RealtimeSession) -> None:
+    def _check_deaf_server(self, session: "RealtimeSession | LocalVoiceSession") -> None:
         """Notice a session that has stopped hearing, and rebuild it.
 
         Twice now a session has gone quiet mid-conversation: the socket stays
@@ -873,12 +874,20 @@ class Daemon:
         if self.state == "error":
             self._set_state("idle")
 
-        session = RealtimeSession(
-            self.cfg,
-            on_audio=self._on_audio,
-            on_event=self._on_event,
-            on_tool_call=self._on_tool_call,
-        )
+        if self.cfg.voice_engine == "local":
+            session = LocalVoiceSession(
+                self.cfg,
+                on_audio=self._on_audio,
+                on_event=self._on_event,
+                on_tool_call=self._on_tool_call,
+            )
+        else:
+            session = RealtimeSession(
+                self.cfg,
+                on_audio=self._on_audio,
+                on_event=self._on_event,
+                on_tool_call=self._on_tool_call,
+            )
         try:
             await session.connect()
         except Exception as exc:  # noqa: BLE001
@@ -914,7 +923,7 @@ class Daemon:
         self._session_task = asyncio.create_task(self._run_session(session), name="realtime")
         return {"ok": True}
 
-    async def _run_session(self, session: RealtimeSession) -> None:
+    async def _run_session(self, session: "RealtimeSession | LocalVoiceSession") -> None:
         try:
             await session.run()
         except asyncio.CancelledError:
