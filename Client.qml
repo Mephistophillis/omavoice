@@ -114,8 +114,12 @@ Item {
     // it as a moment, so it can be felt rather than read.
     if (kind === "barge") root.barged()
 
+    // "stop" ends the wait the same way a result does: Q cancels the agent
+    // mid-question, and a cancelled question never produces a result or an
+    // error — without this the bar kept counting a wait that was already
+    // over, "looking 47s" over a closed microphone.
     if (kind === "agent") root.pendingSince = Date.now()
-    else if (kind === "result" || kind === "error") root.pendingSince = 0
+    else if (kind === "result" || kind === "error" || kind === "stop") root.pendingSince = 0
 
     eventModel.insert(0, {
       kind: kind,
@@ -290,6 +294,10 @@ Item {
         } else if (root.wanted) {
           root.voiceState = "idle"
           root.level = 0
+          // A dropped socket is a dropped answer too: with no daemon there is
+          // nothing left to wait for, and a clock that keeps counting after
+          // the connection is gone counts nothing.
+          root.pendingSince = 0
         }
       }
     }
