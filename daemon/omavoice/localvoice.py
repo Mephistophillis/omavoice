@@ -53,11 +53,16 @@ _CHAT_ONLY = re.compile(
 _SENTENCE_END = re.compile(r"[.!?…]\s|$")
 
 # filler spoken while the brain works — one or two words, like the original
-_FILLERS = ("секунду", "сейчас посмотрю", "проверяю", "секундочку")
+_FILLERS = ("секунду", "сейчас посмотрю", "проверяю", "секундочка")
 
 
 class LocalVoiceSession:
     """One live conversation with local ears and mouth."""
+
+    # Process-level vosk model cache: loading ru-0.42 costs ~70 s and 1.2 GB,
+    # and sessions come and go. None until the first connect() loads it.
+    _MODEL_CACHE = None
+    _MODEL_PATH = None
 
     def __init__(
         self,
@@ -81,6 +86,16 @@ class LocalVoiceSession:
         self.sent_events = 0
         self.last_activity = 0.0
         self._warned_no_socket = False
+        # Recognition runs on ONE dedicated thread (KaldiRecognizer is not
+        # thread-safe; see _start_worker). Audio flows one way, finals the
+        # other; both queues are unbounded but paced by the mic itself.
+        import queue as _queue
+
+        self._audio_q: "queue.Queue[bytes | None]" = _queue.Queue()
+        self._finals_q: "queue.Queue[str | None]" = _queue.Queue()
+        self._worker = None
+        self._worker_started = asyncio.Event()
+        self._drain_task: asyncio.Task | None = None
 
     @property
     def awaiting_first_turn(self) -> bool:
@@ -93,16 +108,29 @@ class LocalVoiceSession:
     # -- lifecycle ----------------------------------------------------------
 
     async def connect(self) -> None:
-        """Load the vosk model. No network, no key."""
+        """Load the vosk model. No network, no key.
+
+        The model is a process-level cache: it is 3.5 GB on disk and ~1.2 GB
+        resident, and a session that ends must not make the next one pay for
+        it again — an early version reloaded it per session and the machine
+        spent a minute and 3 GB of swap doing nothing else.
+        """
         from vosk import Model  # deferred: heavy import
 
-        model_path = str(self.cfg.vosk_model_dir())
-        log.info("loading vosk model %s", model_path)
-        import time
+        self._recognizer = None
+        cls = type(self)
+        if cls._MODEL_CACHE is None or cls._MODEL_PATH != self.cfg.vosk_model_dir():
+            model_path = str(self.cfg.vosk_model_dir())
+            log.info("loading vosk model %s", model_path)
+            import time
 
-        t0 = time.monotonic()
-        self._model = await asyncio.to_thread(Model, model_path)
-        log.info("vosk model ready in %.1fs", time.monotonic() - t0)
+            t0 = time.monotonic()
+            cls._MODEL_CACHE = await asyncio.to_thread(Model, model_path)
+            cls._MODEL_PATH = self.cfg.vosk_model_dir()
+            log.info("vosk model ready in %.1fs", time.monotonic() - t0)
+        else:
+            log.info("vosk model already loaded (cached)")
+        self._model = cls._MODEL_CACHE
         self.last_activity = asyncio.get_running_loop().time()
         self._await_first_turn = True
 
@@ -111,35 +139,73 @@ class LocalVoiceSession:
         self._abort_play.set()
         if self._brain_task and not self._brain_task.done():
             self._brain_task.cancel()
+        if self._drain_task:
+            self._drain_task.cancel()
+        if self._worker is not None:
+            self._audio_q.put_nowait(None)
+            self._finals_q.put_nowait(None)
+        # The recognizer is dropped but the MODEL stays in the cache: the next
+        # session reuses it. KaldiRecognizer holds no audio of its own.
+        self._recognizer = None
         self._model = None
 
     # -- outbound (daemon -> session) ----------------------------------------
 
     async def send_audio(self, pcm: bytes) -> None:
-        """Feed mic PCM16 to vosk. Called from the daemon's mic loop."""
-        await self._feed(pcm)
-
-    async def _feed(self, pcm: bytes) -> None:
+        """Queue mic PCM16 for vosk. Called from the daemon's mic loop."""
         if self._closed or self._model is None:
             return
-        rec = self._recognizer
-        if rec is None:
-            from vosk import KaldiRecognizer
+        if self._worker is None:
+            self._start_worker()
+        self._audio_q.put_nowait(pcm)
 
-            rec = self._recognizer = KaldiRecognizer(self._model, self.cfg.sample_rate)
-            rec.SetWords(False)
-        self.last_activity = asyncio.get_running_loop().time()
-        # vosk is CPU-bound (RTF ~0.33 on this class of machine); keep the
-        # event loop breathing by running recognition in a thread.
-        final = await asyncio.to_thread(self._accept, rec, pcm)
-        if final and not self._speaking:
-            await self._on_final(final)
+    def _start_worker(self) -> None:
+        """One dedicated recognition thread, started lazily on first audio.
 
-    @staticmethod
-    def _accept(rec, pcm: bytes) -> str:
-        if rec.AcceptWaveform(pcm):
-            return json.loads(rec.Result()).get("text", "")
-        return ""
+        KaldiRecognizer is NOT thread-safe, and `asyncio.to_thread` runs its
+        callees on a shared pool: two chunks arriving close together were
+        recognised concurrently from different worker threads, corrupting the
+        recognizer's state until Kaldi's own assert aborted the whole daemon
+        (libvosk KaldiAssertFailure in ExtractWindow). A single long-lived
+        worker thread gives the same loop-breathing without the data race,
+        and the queue keeps chunk order.
+        """
+        import threading
+
+        if self._worker is not None:
+            return
+        self._worker = threading.Thread(target=self._worker_main, name="vosk-rec", daemon=True)
+        self._worker_started.set()
+        self._worker.start()
+
+    def _worker_main(self) -> None:
+        from vosk import KaldiRecognizer
+
+        rec = KaldiRecognizer(self._model, self.cfg.sample_rate)
+        rec.SetWords(False)
+        self._recognizer = rec
+        while True:
+            pcm = self._audio_q.get()
+            if pcm is None:
+                return
+            try:
+                if rec.AcceptWaveform(pcm):
+                    final = json.loads(rec.Result()).get("text", "")
+                    if final:
+                        self._finals_q.put_nowait(final)
+            except Exception:
+                log.exception("vosk recognition failed")
+                return
+
+    async def _feed(self) -> None:
+        """Drain recognised phrases off the worker thread into the loop."""
+        while True:
+            final = await self._finals_q.get()
+            if final is None:
+                return
+            self.last_activity = asyncio.get_running_loop().time()
+            if not self._speaking:
+                await self._on_final(final)
 
     async def _on_final(self, text: str) -> None:
         text = " ".join(text.split()).strip()
@@ -306,9 +372,17 @@ class LocalVoiceSession:
         self._await_first_turn = False
 
     async def run(self) -> None:
-        """Keep the session alive until closed. Audio arrives via send_audio."""
-        while not self._closed:
-            await asyncio.sleep(0.25)
+        """Pump recognised phrases until closed. Audio arrives via send_audio."""
+        self._drain_task = asyncio.create_task(self._feed())
+        try:
+            while not self._closed:
+                await asyncio.sleep(0.25)
+        finally:
+            if self._drain_task:
+                self._drain_task.cancel()
+            if self._worker is not None:
+                self._audio_q.put_nowait(None)
+                self._finals_q.put_nowait(None)
         log.info("local voice session ended")
 
 
