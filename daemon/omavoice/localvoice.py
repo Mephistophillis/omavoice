@@ -87,14 +87,15 @@ class LocalVoiceSession:
         self.last_activity = 0.0
         self._warned_no_socket = False
         # Recognition runs on ONE dedicated thread (KaldiRecognizer is not
-        # thread-safe; see _start_worker). Audio flows one way, finals the
-        # other; both queues are unbounded but paced by the mic itself.
+        # thread-safe; see _start_worker). Audio flows one way through this
+        # queue; finals hop back via loop.call_soon_threadsafe.
         import queue as _queue
 
         self._audio_q: "queue.Queue[bytes | None]" = _queue.Queue()
-        self._finals_q: "queue.Queue[str | None]" = _queue.Queue()
         self._worker = None
-        self._worker_started = asyncio.Event()
+        self._worker_loop = None
+        self._deliver_final = None
+        self._final_tasks: set = set()
         self._drain_task: asyncio.Task | None = None
 
     @property
@@ -143,7 +144,8 @@ class LocalVoiceSession:
             self._drain_task.cancel()
         if self._worker is not None:
             self._audio_q.put_nowait(None)
-            self._finals_q.put_nowait(None)
+            self._worker = None
+            self._deliver_final = None
         # The recognizer is dropped but the MODEL stays in the cache: the next
         # session reuses it. KaldiRecognizer holds no audio of its own.
         self._recognizer = None
@@ -169,13 +171,33 @@ class LocalVoiceSession:
         (libvosk KaldiAssertFailure in ExtractWindow). A single long-lived
         worker thread gives the same loop-breathing without the data race,
         and the queue keeps chunk order.
+
+        Finals cross back with loop.call_soon_threadsafe — the canonical
+        thread->loop bridge; no second queue to deadlock or leak.
         """
         import threading
 
         if self._worker is not None:
             return
-        self._worker = threading.Thread(target=self._worker_main, name="vosk-rec", daemon=True)
-        self._worker_started.set()
+        loop = asyncio.get_running_loop()
+        self._worker_loop = loop
+
+        def _deliver(final: str) -> None:
+            def _run() -> None:
+                self.last_activity = loop.time()
+                if not self._closed and not self._speaking and final:
+                    task = asyncio.ensure_future(self._on_final(final))
+                    self._final_tasks.add(task)
+                    task.add_done_callback(self._final_tasks.discard)
+
+            try:
+                loop.call_soon_threadsafe(_run)
+            except RuntimeError:
+                pass  # loop closed — session is gone anyway
+
+        self._deliver_final = _deliver
+        self._worker = threading.Thread(
+            target=self._worker_main, name="vosk-rec", daemon=True)
         self._worker.start()
 
     def _worker_main(self) -> None:
@@ -192,27 +214,17 @@ class LocalVoiceSession:
                 if rec.AcceptWaveform(pcm):
                     final = json.loads(rec.Result()).get("text", "")
                     if final:
-                        self._finals_q.put_nowait(final)
+                        self._deliver_final(final)
             except Exception:
                 log.exception("vosk recognition failed")
                 return
 
     async def _feed(self) -> None:
-        """Drain recognised phrases off the worker thread into the loop.
+        """Historic drain loop, kept as a no-op seam for tests.
 
-        queue.Queue.get() blocks its calling thread — awaiting it directly
-        would freeze the event loop with the mic still unserved (the loop,
-        the worker and the queue each waiting on the next). `to_thread`
-        parks the blocking get on a pool thread and keeps the loop free;
-        close() puts None through the queue so the parked get returns.
-        """
-        while True:
-            final = await asyncio.to_thread(self._finals_q.get)
-            if final is None:
-                return
-            self.last_activity = asyncio.get_running_loop().time()
-            if not self._speaking:
-                await self._on_final(final)
+        Finals now hop the thread boundary via call_soon_threadsafe (see
+        _start_worker); there is no queue for the loop to wait on."""
+        return
 
     async def _on_final(self, text: str) -> None:
         text = " ".join(text.split()).strip()
@@ -389,7 +401,6 @@ class LocalVoiceSession:
                 self._drain_task.cancel()
             if self._worker is not None:
                 self._audio_q.put_nowait(None)
-                self._finals_q.put_nowait(None)
         log.info("local voice session ended")
 
 
