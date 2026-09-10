@@ -198,9 +198,16 @@ class LocalVoiceSession:
                 return
 
     async def _feed(self) -> None:
-        """Drain recognised phrases off the worker thread into the loop."""
+        """Drain recognised phrases off the worker thread into the loop.
+
+        queue.Queue.get() blocks its calling thread — awaiting it directly
+        would freeze the event loop with the mic still unserved (the loop,
+        the worker and the queue each waiting on the next). `to_thread`
+        parks the blocking get on a pool thread and keeps the loop free;
+        close() puts None through the queue so the parked get returns.
+        """
         while True:
-            final = await self._finals_q.get()
+            final = await asyncio.to_thread(self._finals_q.get)
             if final is None:
                 return
             self.last_activity = asyncio.get_running_loop().time()
