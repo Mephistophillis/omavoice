@@ -1362,7 +1362,7 @@ class Daemon:
                 "gender": config.gender_of(self.cfg.voice),
                 "session": self.session is not None,
                 "background": self.backgrounded,
-                "hasKey": bool(self.cfg.api_key),
+                "hasKey": bool(self.cfg.api_key) or self.cfg.voice_engine == "local",
                 # Which microphone is actually feeding the session. Worth a line
                 # of its own: every device in play can present itself under the
                 # same name, and a silent substitution reads as a broken
@@ -1384,7 +1384,7 @@ class Daemon:
         self.server.broadcast({"type": "state", "state": "idle"})
         self.server.broadcast({"type": "backend", "backend": self.brain.backend})
         self.server.broadcast({"type": "voice", "voice": self.cfg.voice})
-        self.server.broadcast({"type": "key", "hasKey": bool(self.cfg.api_key)})
+        self.server.broadcast({"type": "key", "hasKey": bool(self.cfg.api_key) or self.cfg.voice_engine == "local"})
         self._broadcast_access()
         # The catalogue lives in one place — here — so the panel never has a
         # stale copy of which voices exist or which gender each speaks in.
