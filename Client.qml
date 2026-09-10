@@ -118,8 +118,18 @@ Item {
     // mid-question, and a cancelled question never produces a result or an
     // error — without this the bar kept counting a wait that was already
     // over, "looking 47s" over a closed microphone.
-    if (kind === "agent") root.pendingSince = Date.now()
-    else if (kind === "result" || kind === "error" || kind === "stop") root.pendingSince = 0
+    //
+    // The freshness guard on "agent" is the other half: the daemon replays
+    // its event tail on every reconnect, and a daemon that died mid-question
+    // leaves a stale "agent" in that tail with nothing behind it. Arming the
+    // clock from it meant a counter that ticked forever over a question no
+    // one was answering. Only an event that just happened can start a wait.
+    if (kind === "agent") {
+      const age = Date.now() / 1000 - (Number(message.at) || 0)
+      root.pendingSince = age >= 0 && age < 5 ? Date.now() : 0
+    } else if (kind === "result" || kind === "error" || kind === "stop") {
+      root.pendingSince = 0
+    }
 
     eventModel.insert(0, {
       kind: kind,
