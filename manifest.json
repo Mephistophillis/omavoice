@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "io.github.baranskyi.omavoice",
   "name": "Omavoice",
-  "version": "0.11.1",
+  "version": "0.12.0",
   "author": "Slava Baranskyi",
   "license": "MIT",
-  "description": "Talk to a local agent out loud. OpenAI Realtime does the hearing and the speaking; codex or claude finds the answer on this machine and on the web.",
-  "repository": "https://github.com/baranskyi/omavoice",
+  "description": "Talk to your local agent out loud. Vosk hears you, a Hermes gateway agent finds the answer, edge-tts speaks it back — all local, no cloud voice API.",
+  "repository": "https://github.com/Mephistophillis/omavoice-hermes",
   "kinds": ["overlay", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {
@@ -21,7 +21,7 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "backend": "codex",
+      "backend": "hermes",
       "showLabel": true
     },
     "schema": [
@@ -29,9 +29,9 @@
         "key": "backend",
         "type": "enum",
         "label": "Local agent",
-        "description": "Who finds the answer: codex runs on a ChatGPT subscription, claude knows your skills and MCP servers.",
-        "options": ["codex", "claude"],
-        "defaultValue": "codex"
+        "description": "Who finds the answer: hermes is the local gateway agent (default); codex and claude remain available if installed.",
+        "options": ["hermes", "codex", "claude"],
+        "defaultValue": "hermes"
       },
       {
         "key": "showLabel",

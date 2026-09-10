@@ -169,7 +169,7 @@ class Config:
     gate_level: float | None = field(default_factory=lambda: _env_gate())
 
     # --- brain -------------------------------------------------------------
-    backend: str = field(default_factory=lambda: os.environ.get("OMAVOICE_BACKEND", "codex"))
+    backend: str = field(default_factory=lambda: os.environ.get("OMAVOICE_BACKEND", "hermes"))
     brain_timeout: float = 60.0
     # The folder this assistant works in — and, deliberately, the only one.
     #

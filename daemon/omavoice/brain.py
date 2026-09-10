@@ -440,7 +440,7 @@ def _read_capped(path: Path, limit: int, what: str) -> str:
 class Brain:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes") else "codex"
+        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes") else "hermes"
         # One thread per backend, so flipping the switch mid-conversation does
         # not try to resume a codex thread inside claude.
         self._threads: dict[str, str] = {}

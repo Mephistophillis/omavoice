@@ -158,7 +158,13 @@ BarWidget {
       return root.micOpen ? what + "\nRight-click to stop listening" : what
     }
     onPressed: function (b) {
-      if (b === Qt.MiddleButton) client.setBackend(client.backend === "codex" ? "claude" : "codex")
+      // Middle-click cycles the agent: hermes -> codex -> claude -> hermes.
+      // The daemon refuses a backend that is not installed, so the worst case
+      // is a no-op with a log line, never a broken switch.
+      if (b === Qt.MiddleButton) {
+        const order = ["hermes", "codex", "claude"]
+        client.setBackend(order[(order.indexOf(client.backend) + 1) % order.length])
+      }
       else if (b === Qt.RightButton) root.stopListening()
       else root.togglePanel()
     }

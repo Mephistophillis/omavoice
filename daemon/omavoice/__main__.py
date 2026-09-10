@@ -267,7 +267,7 @@ class Daemon:
         if voice in config.VOICE_GENDER:
             self.cfg.voice = voice
         backend = str(data.get("backend") or "")
-        if backend in ("codex", "claude"):
+        if backend in ("hermes", "codex", "claude"):
             self.brain.backend = backend
         self.onboarded = bool(data.get("onboarded"))
         # An environment variable is a deliberate override and outranks a
@@ -293,7 +293,7 @@ class Daemon:
         consented = data.get("consented")
         if isinstance(consented, list):
             self.cfg.consented = {
-                name for name in consented if name in ("codex", "claude")
+                name for name in consented if name in ("hermes", "codex", "claude")
             }
         unrestricted = data.get("unrestricted")
         if isinstance(unrestricted, list):
@@ -1315,7 +1315,7 @@ class Daemon:
 
         if command == "consent":
             name = str(message.get("backend") or "")
-            if name not in ("codex", "claude"):
+            if name not in ("hermes", "codex", "claude"):
                 return {"ok": False, "error": f"unknown agent: {name}"}
             granted = bool(message.get("granted"))
             if granted:
@@ -1339,7 +1339,7 @@ class Daemon:
             # been allowed at all, because the screen offers them in that order
             # and a state it cannot draw is a state nobody can withdraw.
             name = str(message.get("backend") or "")
-            if name not in ("codex", "claude"):
+            if name not in ("hermes", "codex", "claude"):
                 return {"ok": False, "error": f"unknown agent: {name}"}
             granted = bool(message.get("granted"))
             if granted and name not in self.cfg.consented:
@@ -1469,7 +1469,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(prog="omavoice", description="Voice assistant daemon for Omarchy")
     parser.add_argument("--headless", action="store_true", help="start a session immediately, without the panel")
-    parser.add_argument("--backend", choices=("codex", "claude"), default=None)
+    parser.add_argument("--backend", choices=("hermes", "codex", "claude"), default=None)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
