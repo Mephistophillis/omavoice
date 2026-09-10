@@ -923,6 +923,16 @@ class Daemon:
         self._session_task = asyncio.create_task(self._run_session(session), name="realtime")
         return {"ok": True}
 
+    async def _warm_vosk(self) -> None:
+        """Load the vosk model once at daemon start (local engine only)."""
+        from vosk import Model
+
+        path = str(self.cfg.vosk_model_dir())
+        t0 = time.monotonic()
+        LocalVoiceSession._MODEL_CACHE = await asyncio.to_thread(Model, path)
+        LocalVoiceSession._MODEL_PATH = self.cfg.vosk_model_dir()
+        log.info("vosk model warmed in %.1fs (cached for sessions)", time.monotonic() - t0)
+
     async def _run_session(self, session: "RealtimeSession | LocalVoiceSession") -> None:
         try:
             await session.run()
@@ -1403,7 +1413,15 @@ class Daemon:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self._stopping.set)
 
-        log.info("ready (backend=%s, key=%s)", self.brain.backend, "yes" if self.cfg.api_key else "NO")
+        log.info("ready (backend=%s, key=%s, engine=%s)",
+                 self.brain.backend, "yes" if self.cfg.api_key else "NO",
+                 self.cfg.voice_engine)
+        if self.cfg.voice_engine == "local":
+            # Warm the vosk model in the background so the first panel open
+            # does not pay the ~70 s load. The session's connect() will find
+            # it in the class-level cache and return immediately.
+            asyncio.create_task(self._warm_vosk(), name="vosk-warm")
+
         # So a panel opened before the first conversation already knows what
         # the audio path would be, rather than showing an empty settings page.
         await self._broadcast_audio()
