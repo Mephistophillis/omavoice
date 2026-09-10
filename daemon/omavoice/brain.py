@@ -541,7 +541,14 @@ class Brain:
         default, so both are checked in one place — here — rather than being
         assumed anywhere that wants to ask a question. A backend that has not
         been permitted is not asked a smaller question; it is not asked.
+
+        The hermes backend is exempt from both: it is the person's own
+        already-running agent, configured by them outside this plugin, and
+        gating it behind a folder picker that does not apply to it would
+        block every question for no reason.
         """
+        if self.backend == "hermes":
+            return ""
         if self.cfg.brain_cwd is None:
             return ("No folder has been chosen for me to work in yet. "
                     "Open the panel and pick one.")

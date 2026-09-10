@@ -1354,6 +1354,10 @@ class Daemon:
                 "unrestricted": sorted(self.cfg.unrestricted),
                 "state": self.state,
                 "backend": self.brain.backend,
+                "engine": self.cfg.voice_engine,
+                # The local voice engine needs no OpenAI key; reporting the
+                # raw absence here would make a stripped panel nag for one.
+                "hasKey": bool(self.cfg.api_key) or self.cfg.voice_engine == "local",
                 "voice": self.cfg.voice,
                 "gender": config.gender_of(self.cfg.voice),
                 "session": self.session is not None,
