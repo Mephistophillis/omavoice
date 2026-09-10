@@ -145,8 +145,13 @@ class Config:
     # 500 ms is what the API suggests and it is too eager for a person
     # composing a question out loud: "what is the weather in Malaga... in
     # Spain" was being cut after the fourth word and sent as a fragment.
+    # 1500 for the local engine: vosk needs ~0.3-0.5 s of fresh speech before
+    # its first partial appears, so the threshold must cover pause + partial
+    # latency or a resumed clause still splits the turn (measured: 0.8 s pause
+    # + 0.5 s latency beat 1100 ms by ~0.2 s). The wait is hidden by the
+    # filler spoken while the brain works.
     silence_ms: int = field(
-        default_factory=lambda: int(os.environ.get("OMAVOICE_SILENCE_MS", "1100"))
+        default_factory=lambda: int(os.environ.get("OMAVOICE_SILENCE_MS", "1500"))
     )
     # The API default. It used to be 0.82, on the theory that a laptop mic hears
     # keyboards and fans and every false positive is the assistant answering

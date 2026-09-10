@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import subprocess
+import time
 from collections.abc import Awaitable, Callable
 
 from .config import Config
@@ -204,20 +205,139 @@ class LocalVoiceSession:
         from vosk import KaldiRecognizer
 
         rec = KaldiRecognizer(self._model, self.cfg.sample_rate)
-        rec.SetWords(False)
+        # Word timings in finals: the anchor for our own endpointing. Vosk
+        # commits a final ~0.3-0.5 s AFTER the speech it describes ended (its
+        # internal endpointer waits for its own silence window first), so
+        # "when the final arrived" is the wrong place to start counting OUR
+        # silence window from — the two windows overlap and the effective
+        # threshold shrinks below what silence_ms promises. The last word's
+        # `end` is when the person actually stopped talking.
+        rec.SetWords(True)
         self._recognizer = rec
+
+        # Our own endpointing, on top of vosk's. Vosk commits a final after
+        # ~0.5 s of silence — its own threshold, not ours, and not tunable
+        # through the C API. A person composing a question out loud pauses
+        # between clauses ("what's the weather in Malaga… in Spain"), and vosk
+        # hands us each clause as a finished phrase. The old code sent every
+        # clause straight to the brain, so "ну" became a question of its own.
+        #
+        # Instead: accumulate the turn in a buffer. Each new final APPENDS to
+        # it; each partial with new words resets the silence clock (speech is
+        # still evolving); silence that lasts `silence_ms` since the speech
+        # actually ENDED (per word timings, not per vosk's late commit) means
+        # the person has stopped talking — flush the whole buffer as one turn.
+        final_parts: list[str] = []
+        partial_text = ""
+        # `now` minus this is the silence elapsed; anchored to speech end.
+        last_change = time.monotonic()
+        audio_t = 0.0  # seconds of audio pulled off the queue
+        bytes_per_s = self.cfg.sample_rate * self.cfg.channels * 2
+        silence_s = max(0.2, self.cfg.silence_ms / 1000.0)
+
+        import array as _array
+
+        def _voiced(chunk: bytes) -> bool:
+            """Is there speech in this chunk, by energy alone.
+
+            The daemon's gate replaces sub-floor noise with zeros before this
+            audio arrives, so anything clearly non-zero is above the room's
+            measured floor. Energy rises within one chunk of speech starting
+            — unlike a vosk partial, which needs 0.3-0.9 s of decoding first
+            and let a resumed clause miss the flush deadline (measured).
+            """
+            if not chunk:
+                return False
+            samples = _array.array("h")
+            samples.frombytes(chunk[: len(chunk) - len(chunk) % 2])
+            if not samples:
+                return False
+            peak = max(abs(s) for s in samples)
+            return peak > 200
+
         while True:
             pcm = self._audio_q.get()
             if pcm is None:
+                # Session over: a turn still in the buffer is delivered, not
+                # dropped — the person said it, and vanishing speech is worse
+                # than an abrupt end.
+                if final_parts or partial_text:
+                    self._flush_turn(final_parts, partial_text, rec)
                 return
+            audio_t += len(pcm) / bytes_per_s
+
+            # Echo guard: while the assistant is speaking, the mic still runs
+            # (the canceller is good but not perfect), and the old code's
+            # "drop finals during playback" invariant must survive the
+            # accumulator — otherwise the assistant's own residual echo piles
+            # up in the buffer and is answered as a turn once it ends.
+            if self._speaking:
+                if final_parts or partial_text:
+                    final_parts = []
+                    partial_text = ""
+                    rec.Reset()
+                continue
+
             try:
                 if rec.AcceptWaveform(pcm):
-                    final = json.loads(rec.Result()).get("text", "")
+                    result = json.loads(rec.Result())
+                    final = result.get("text", "")
                     if final:
-                        self._deliver_final(final)
+                        final_parts.append(final)
+                        partial_text = ""
+                        # Anchor the clock to when the speech ended, not to
+                        # when vosk got around to telling us. audio_t is the
+                        # audio clock; the mic feeds real-time, so audio
+                        # seconds and wall seconds advance together.
+                        words = result.get("result") or []
+                        speech_end = float(words[-1]["end"]) if words else audio_t
+                        lag = min(max(audio_t - speech_end, 0.0), 2.0)
+                        last_change = time.monotonic() - lag
+                partial = json.loads(rec.PartialResult()).get("partial", "")
+                if (partial and partial != partial_text) or _voiced(pcm):
+                    # New words mid-stream, or energy above the floor: speech
+                    # is alive and the turn keeps growing. The clock restarts.
+                    partial_text = partial or partial_text
+                    last_change = time.monotonic()
+                elif final_parts or partial_text:
+                    # Silence while a turn is open: flush once it has lasted
+                    # long enough. Measured from the anchored speech end, so
+                    # vosk's commit delay cannot eat into the budget.
+                    if time.monotonic() - last_change >= silence_s:
+                        self._flush_turn(final_parts, partial_text, rec)
+                        final_parts = []
+                        partial_text = ""
+                else:
+                    # Idle noise before any speech: nothing to keep, nothing
+                    # to flush; do not let phantom partials arm the clock.
+                    pass
             except Exception:
                 log.exception("vosk recognition failed")
                 return
+
+    def _flush_turn(self, final_parts: list[str], partial_text: str, rec) -> None:
+        """Commit the accumulated turn and hand it to the conversation loop."""
+        # Prefer the committed finals; a trailing partial is a clause vosk
+        # never committed — better than losing it, worse than a final, so it
+        # is appended only when there is nothing committed after it.
+        text = " ".join(part.strip() for part in final_parts if part.strip())
+        partial = (partial_text or "").strip()
+        if not text:
+            text = partial
+        elif partial and partial != final_parts[-1].strip():
+            # The partial has grown past the last final (speech resumed after
+            # the commit but before our flush): keep its tail only.
+            last = final_parts[-1].strip()
+            if partial.startswith(last):
+                text = text + " " + partial[len(last):].strip()
+            else:
+                text = text + " " + partial
+        text = " ".join(text.split())
+        if text:
+            log.info("turn: %s", text[:160])
+            if self._deliver_final is not None:
+                self._deliver_final(text)
+        rec.Reset()
 
     async def _feed(self) -> None:
         """Historic drain loop, kept as a no-op seam for tests.
