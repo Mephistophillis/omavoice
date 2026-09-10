@@ -54,7 +54,29 @@ asked a question is a hazard. Answer from your own knowledge; say what you \
 would check and let them run it.
 """
 
+_OLLAMA_SYSTEM = """\
+You are the brain of a local voice assistant running entirely offline on the \
+person's own computer. Your answer will be spoken out loud by a text-to-speech \
+voice and shown in a small desktop panel.
+
+Reply with STRICT JSON only, no markdown fences: \
+{"spoken": "...", "markdown": "..."} \
+- spoken: 1-3 short conversational sentences in the user's language. \
+This is what the voice says — no lists, no paths, no URLs read aloud.
+- markdown: optional fuller answer for the panel screen, same language.
+- The person is talking to you by voice; keep every turn brief.
+- You have NO tools and NO access to this machine, files or the web. \
+Answer from your own knowledge; if you do not know, say so briefly.
+"""
+
 _HERMES_TIMEOUT_S = 120
+
+# The local ollama server answers in 3-10 s warm, but loading a model into RAM
+# costs 20-30 s — too long to sit inside a voice turn. Warmed at daemon start
+# and re-pinned with keep_alive on every ask, so a conversation pays the load
+# once per daemon lifetime, not once per question.
+_OLLAMA_TIMEOUT_S = 90
+_OLLAMA_KEEP_ALIVE = "2h"
 
 log = logging.getLogger("omavoice.brain")
 
@@ -170,6 +192,17 @@ def _coerce(raw: str) -> Answer:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
+        # A small local model under a token cap writes valid JSON that is
+        # simply unfinished: {"spoken": "…", "markdown": "… (cut). The voice
+        # only needs `spoken`, and it is always the first field — so pull it
+        # out rather than falling back to speaking raw JSON punctuation.
+        m = re.search(r'"spoken"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+        if m:
+            try:
+                spoken = json.loads('"' + m.group(1) + '"')
+            except json.JSONDecodeError:
+                spoken = m.group(1)
+            return Answer(spoken=_clip(spoken.strip() or "Done.", _MAX_SPOKEN))
         return Answer(spoken=_clip(raw.strip(), _MAX_SPOKEN), markdown="")
 
     if not isinstance(data, dict):
@@ -440,23 +473,29 @@ def _read_capped(path: Path, limit: int, what: str) -> str:
 class Brain:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes") else "hermes"
+        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes", "ollama") else "hermes"
         # One thread per backend, so flipping the switch mid-conversation does
         # not try to resume a codex thread inside claude.
         self._threads: dict[str, str] = {}
         self._job: _Job | None = None
-        # The hermes backend keeps the dialog in-process instead (the gateway
-        # holds the session); keyed the same way for symmetry.
-        self._hermes_history: list[dict] = []
+        # The hermes and ollama backends keep the dialog in-process instead
+        # (ollama sees the full message list on every ask; the gateway holds
+        # the session); keyed the same way for symmetry. Seeded here, not
+        # only in reset(): the text `ask` IPC path runs before any session
+        # starts, and a local model asked without its system prompt has no
+        # JSON contract and no language instruction — measured, it invents
+        # field names ("text") or answers in the wrong shape entirely.
+        self._hermes_history: list[dict] = [{"role": "system", "content": _HERMES_SYSTEM}]
+        self._ollama_history: list[dict] = [{"role": "system", "content": _OLLAMA_SYSTEM}]
         self._lock = asyncio.Lock()
         self._on_trace: "Callable[[str], None] | None" = None
 
     # -- lifecycle ----------------------------------------------------------
 
     def set_backend(self, name: str) -> bool:
-        if name not in ("codex", "claude", "hermes"):
+        if name not in ("codex", "claude", "hermes", "ollama"):
             return False
-        if name != "hermes" and not shutil.which(name):
+        if name != "hermes" and name != "ollama" and not shutil.which(name):
             log.warning("backend %s is not installed", name)
             return False
         self.backend = name
@@ -466,6 +505,7 @@ class Brain:
         """Forget conversation history. A new panel session starts clean."""
         self._threads.clear()
         self._hermes_history = [{"role": "system", "content": _HERMES_SYSTEM}]
+        self._ollama_history = [{"role": "system", "content": _OLLAMA_SYSTEM}]
 
     def watch(self, on_trace: "Callable[[str], None] | None") -> None:
         """Be told what the agent is doing while it is doing it.
@@ -546,12 +586,14 @@ class Brain:
         assumed anywhere that wants to ask a question. A backend that has not
         been permitted is not asked a smaller question; it is not asked.
 
-        The hermes backend is exempt from both: it is the person's own
-        already-running agent, configured by them outside this plugin, and
-        gating it behind a folder picker that does not apply to it would
-        block every question for no reason.
+        The hermes and ollama backends are exempt from both: hermes is the
+        person's own already-running agent, configured by them outside this
+        plugin, and ollama answers from a local model with no tools at all —
+        either way there is nothing on this machine for a folder picker to
+        bound, and gating them behind it would block every question for no
+        reason.
         """
-        if self.backend == "hermes":
+        if self.backend in ("hermes", "ollama"):
             return ""
         if self.cfg.brain_cwd is None:
             return ("No folder has been chosen for me to work in yet. "
@@ -588,6 +630,8 @@ class Brain:
 
         if self.backend == "hermes":
             pass  # no binary to check; the gateway is probed on first ask
+        elif self.backend == "ollama":
+            pass  # a local HTTP server, probed on first ask like the gateway
         elif not shutil.which(self.backend):
             return Answer.error(f"The {self.backend} agent is not installed.")
 
@@ -618,6 +662,8 @@ class Brain:
                     return await self._ask_codex(query)
                 if self.backend == "hermes":
                     return await self._ask_hermes(query)
+                if self.backend == "ollama":
+                    return await self._ask_ollama(query)
                 return await self._ask_claude(query)
             except asyncio.TimeoutError:
                 # `_run` has already ended the group by the time this is
@@ -698,13 +744,96 @@ class Brain:
             answer_text = json.loads(raw)["choices"][0]["message"]["content"] or ""
         except (json.JSONDecodeError, KeyError, IndexError, TypeError):
             self._hermes_history.pop()
-            return Answer(spoken=_clip(raw.decode(errors="replace")[:_MAX_SPOKEN]))
+            # Degenerate reply: speak the raw bytes rather than raising. The
+            # slice happens inside _clip — the call used to pass the already
+            # sliced text without the limit, which raised TypeError here.
+            return Answer(spoken=_clip(raw.decode(errors="replace"), _MAX_SPOKEN))
 
         self._hermes_history.append({"role": "assistant", "content": answer_text})
         if len(self._hermes_history) > 16:
             del self._hermes_history[1:3]  # keep system + bounded turns
         answer = _coerce(answer_text)
         self._trace(f"hermes: {answer.spoken[:120]}")
+        return answer
+
+    async def _ask_ollama(self, query: str) -> Answer:
+        """Ask a local ollama model — the brain with no cloud and no tools.
+
+        A small CPU model (qwen2.5:3b class) answers a spoken question in a
+        few seconds warm, entirely offline. It has no tools, so the system
+        prompt keeps it to its own knowledge — and history lives here like
+        for hermes, because ollama is stateless between HTTP calls.
+
+        The native /api/chat endpoint rather than the OpenAI-compatible /v1
+        one: keep_alive — which pins the model in RAM between voice turns —
+        is only honoured on the native route (measured: /v1 drops it and the
+        model unloads after five minutes of quiet, putting a 20-30 s load
+        into the next question).
+        """
+        import urllib.request
+        import urllib.error
+
+        base = os.environ.get("OMAVOICE_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+        model = os.environ.get("OMAVOICE_OLLAMA_MODEL", "qwen2.5:3b")
+
+        self._ollama_history.append({"role": "user", "content": query})
+        # num_predict is a hard voice guarantee, not a style hint: a confused
+        # small model rambles (measured: 211 tokens of hallucination on a
+        # question it did not know), and at ~4 tokens/s on this CPU every
+        # extra hundred tokens is 25 more seconds of silence. But too small a
+        # cap cuts the JSON mid-markdown (measured at 96: the model fills
+        # "spoken", then duplicates the answer into "markdown" and runs out);
+        # 160 leaves headroom for both fields and `_coerce` recovers the rest.
+        # num_ctx 2048: the bounded 16-message history never needs 4096, and
+        # the smaller KV cache is real RAM this box does not have to swap.
+        body = {
+            "model": model,
+            "messages": self._ollama_history,
+            "stream": False,
+            "keep_alive": _OLLAMA_KEEP_ALIVE,
+            # Grammar-forced JSON: measured, a 3B model honors the "reply with
+            # JSON" instruction on some turns and quietly writes a markdown
+            # list on others; ollama's format flag constrains the sampler and
+            # turns "sometimes" into "always". Field shape is still the
+            # prompt's job — _coerce recovers a truncated or odd reply.
+            "format": "json",
+            "options": {"temperature": 0.3, "num_predict": 160, "num_ctx": 2048},
+        }
+        req = urllib.request.Request(
+            f"{base}/api/chat",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        self._trace(f"ollama: {query[:120]}")
+        try:
+            def _fetch() -> bytes:
+                with urllib.request.urlopen(req, timeout=_OLLAMA_TIMEOUT_S) as r:
+                    return r.read()
+
+            raw = await asyncio.to_thread(_fetch)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode(errors="replace")
+            self._ollama_history.pop()  # a failed turn is not context
+            return Answer.error(f"Ollama error {exc.code}: {detail}")
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            self._ollama_history.pop()
+            log.warning("ollama unreachable: %s", exc)
+            return Answer.error(
+                "The ollama server is not reachable — is ollama running?"
+            )
+
+        try:
+            answer_text = json.loads(raw)["message"]["content"] or ""
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            self._ollama_history.pop()
+            return Answer(spoken=_clip(raw.decode(errors="replace"), _MAX_SPOKEN))
+
+        self._ollama_history.append({"role": "assistant", "content": answer_text})
+        if len(self._ollama_history) > 16:
+            del self._ollama_history[1:3]  # keep system + bounded turns
+        answer = _coerce(answer_text)
+        self._trace(f"ollama: {answer.spoken[:120]}")
         return answer
 
     async def _drain(
@@ -1079,7 +1208,7 @@ async def _main() -> int:
 
     parser = argparse.ArgumentParser(description="Ask the local agent one question")
     parser.add_argument("query", nargs="+")
-    parser.add_argument("--backend", choices=("codex", "claude"), default=None)
+    parser.add_argument("--backend", choices=("hermes", "ollama", "codex", "claude"), default=None)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

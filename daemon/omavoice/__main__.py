@@ -267,7 +267,7 @@ class Daemon:
         if voice in config.VOICE_GENDER:
             self.cfg.voice = voice
         backend = str(data.get("backend") or "")
-        if backend in ("hermes", "codex", "claude"):
+        if backend in ("hermes", "ollama", "codex", "claude"):
             self.brain.backend = backend
         self.onboarded = bool(data.get("onboarded"))
         # An environment variable is a deliberate override and outranks a
@@ -293,7 +293,7 @@ class Daemon:
         consented = data.get("consented")
         if isinstance(consented, list):
             self.cfg.consented = {
-                name for name in consented if name in ("hermes", "codex", "claude")
+                name for name in consented if name in ("hermes", "ollama", "codex", "claude")
             }
         unrestricted = data.get("unrestricted")
         if isinstance(unrestricted, list):
@@ -933,6 +933,47 @@ class Daemon:
         LocalVoiceSession._MODEL_PATH = self.cfg.vosk_model_dir()
         log.info("vosk model warmed in %.1fs (cached for sessions)", time.monotonic() - t0)
 
+    async def _warm_ollama(self) -> None:
+        """Load the ollama brain model into RAM at daemon start.
+
+        A warm qwen2.5:3b answers in 3-10 s; a cold one pays 20-30 s of
+        mmap/madvise inside the first voice turn, which reads as a hung
+        assistant. One tiny request pins the model with keep_alive so every
+        later ask finds it resident. Failure is a log line, never a crash:
+        the first ask will simply be the one that warms it.
+        """
+        import urllib.request
+        import urllib.error
+
+        base = os.environ.get("OMAVOICE_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+        model = os.environ.get("OMAVOICE_OLLAMA_MODEL", "qwen2.5:3b")
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+            "keep_alive": "2h",
+            "options": {"num_predict": 1},
+        }).encode()
+        req = urllib.request.Request(
+            f"{base}/api/chat", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        started = time.monotonic()
+        try:
+            def _fetch() -> None:
+                with urllib.request.urlopen(req, timeout=120):
+                    pass
+
+            await asyncio.to_thread(_fetch)
+            log.info("ollama model %s warmed in %.1fs (keep_alive pins it)",
+                     model, time.monotonic() - started)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode(errors="replace")
+            log.warning("ollama warm-up failed (HTTP %s): %s — run `ollama pull %s`?",
+                        exc.code, detail, model)
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            log.warning("ollama warm-up skipped — server not reachable: %s", exc)
+
     async def _run_session(self, session: "RealtimeSession | LocalVoiceSession") -> None:
         try:
             await session.run()
@@ -1228,6 +1269,10 @@ class Daemon:
             if ok:
                 self._save_preferences()
                 self.server.broadcast({"type": "backend", "backend": self.brain.backend})
+                if self.brain.backend == "ollama":
+                    # Switching to a cold local model would put its load time
+                    # into the next question; warm it in the background now.
+                    asyncio.create_task(self._warm_ollama(), name="ollama-warm")
             return {"ok": ok, "backend": self.brain.backend}
 
         if command == "ask":
@@ -1315,7 +1360,7 @@ class Daemon:
 
         if command == "consent":
             name = str(message.get("backend") or "")
-            if name not in ("hermes", "codex", "claude"):
+            if name not in ("hermes", "ollama", "codex", "claude"):
                 return {"ok": False, "error": f"unknown agent: {name}"}
             granted = bool(message.get("granted"))
             if granted:
@@ -1339,7 +1384,7 @@ class Daemon:
             # been allowed at all, because the screen offers them in that order
             # and a state it cannot draw is a state nobody can withdraw.
             name = str(message.get("backend") or "")
-            if name not in ("hermes", "codex", "claude"):
+            if name not in ("hermes", "ollama", "codex", "claude"):
                 return {"ok": False, "error": f"unknown agent: {name}"}
             granted = bool(message.get("granted"))
             if granted and name not in self.cfg.consented:
@@ -1421,6 +1466,10 @@ class Daemon:
             # does not pay the ~70 s load. The session's connect() will find
             # it in the class-level cache and return immediately.
             asyncio.create_task(self._warm_vosk(), name="vosk-warm")
+        if self.brain.backend == "ollama":
+            # Same idea, other organ: the brain's model pays its load here
+            # rather than inside the first spoken question.
+            asyncio.create_task(self._warm_ollama(), name="ollama-warm")
 
         # So a panel opened before the first conversation already knows what
         # the audio path would be, rather than showing an empty settings page.
@@ -1469,7 +1518,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(prog="omavoice", description="Voice assistant daemon for Omarchy")
     parser.add_argument("--headless", action="store_true", help="start a session immediately, without the panel")
-    parser.add_argument("--backend", choices=("hermes", "codex", "claude"), default=None)
+    parser.add_argument("--backend", choices=("hermes", "ollama", "codex", "claude"), default=None)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

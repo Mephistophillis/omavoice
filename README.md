@@ -80,6 +80,7 @@ for the text tokens your Hermes provider already charges.
 | **PipeWire** with `pw-record` / `pw-play` | audio in and out | standard on Omarchy |
 | **Python 3.11+** | the daemon | the virtualenv is built from your own `python3`; `uv`, if present, only installs the pinned package |
 | *optional:* `codex` / `claude` on `PATH` | alternate brains | not needed for the hermes backend |
+| *optional:* `ollama` + a small model | fully-local brain (`OMAVOICE_BACKEND=ollama`) | qwen2.5:3b measured: 3–10 s warm answers on a 2-core CPU; 8B models do not fit 7.5 GB RAM |
 
 Packages installed into the virtualenv (`vosk`, `edge-tts`, `websockets`,
 `aiohttp`) come from `daemon/requirements.lock`, version-pinned and bound to
@@ -100,12 +101,14 @@ Settings live in `~/.config/omavoice/env` and are read once at daemon start:
 
 ```bash
 OMAVOICE_VOICE_ENGINE=local          # "realtime" returns to the upstream OpenAI path (needs its paid key)
-OMAVOICE_BACKEND=hermes              # hermes | codex | claude
+OMAVOICE_BACKEND=hermes              # hermes | ollama | codex | claude
 OMAVOICE_VOSK_MODEL=vosk-model-ru-0.42
 OMAVOICE_TTS_VOICE=ru-RU-DmitryNeural
 OMAVOICE_SILENCE_MS=1500             # pause that ends a turn
 # OMAVOICE_HERMES_URL=http://127.0.0.1:8642
 # OMAVOICE_HERMES_MODEL=glm-5.3-flash   # optional, for a gateway with several
+# OMAVOICE_OLLAMA_MODEL=qwen2.5:3b       # local brain, no cloud at all
+# OMAVOICE_OLLAMA_URL=http://127.0.0.1:11434
 ```
 
 The gateway key is read from `~/.hermes/.env` (`API_SERVER_KEY`) at ask time —
