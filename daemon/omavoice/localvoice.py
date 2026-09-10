@@ -312,12 +312,17 @@ class LocalVoiceSession:
 
         Playback of a long answer can be aborted (barge-in / cancel):
         synthesis and conversion tasks are stopped, the queue drained.
+        Each utterance starts by CLEARING the abort flag — cancel_response()
+        sets it, and without this reset every later utterance (a smalltalk
+        reply, an error line) would be born already aborted and stay silent
+        forever.
         """
         import edge_tts
 
         text = (text or "").strip()
         if not text or self._closed:
             return
+        self._abort_play.clear()
         self._speaking = True
         try:
             ff = subprocess.Popen(

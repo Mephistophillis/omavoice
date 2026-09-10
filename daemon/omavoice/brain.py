@@ -647,10 +647,25 @@ class Brain:
                     break
 
         self._hermes_history.append({"role": "user", "content": query})
-        body = json.dumps({"messages": self._hermes_history}).encode()
+        body = {
+            "messages": self._hermes_history,
+            # A voice conversation cannot wait out chain-of-thought: measured
+            # on this gateway, the same question takes ~3.5 s with reasoning
+            # off and 8-20 s with it on. The person can ask for depth in the
+            # question itself when they want it.
+            "model_options": {"reasoning": {"enabled": False}},
+        }
+        # Optional steering: a faster model / explicit provider, for people
+        # whose gateway runs several. OMAVOICE_HERMES_MODEL=glm-5.3-flash.
+        want_model = os.environ.get("OMAVOICE_HERMES_MODEL", "").strip()
+        if want_model:
+            body["model"] = want_model
+        want_provider = os.environ.get("OMAVOICE_HERMES_PROVIDER", "").strip()
+        if want_provider:
+            body["provider"] = want_provider
         req = urllib.request.Request(
             f"{base}/v1/chat/completions",
-            data=body,
+            data=json.dumps(body).encode(),
             headers={
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
