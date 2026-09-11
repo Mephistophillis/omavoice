@@ -1305,12 +1305,6 @@ class Daemon:
                     asyncio.create_task(self._warm_ollama(), name="ollama-warm")
             return {"ok": ok, "backend": self.brain.backend}
 
-        if command == "keydbg":
-            # TEMP DIAGNOSTIC: what the panel's key handler actually receives.
-            log.info("keydbg: key=%s sc=%s text=%r",
-                     message.get("key"), message.get("sc"), message.get("text"))
-            return {"ok": True}
-
         if command == "ptt":
             # Push-to-talk gate: `held` true while the panel's V key is down.
             # The daemon forwards the boundary to the session so the turn is

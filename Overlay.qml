@@ -194,9 +194,6 @@ Item {
           return false
         }
         Keys.onPressed: function (event) {
-          // TEMP DIAGNOSTIC: raw key values to the daemon log, to see what
-          // this build actually delivers (key / scan code / text) per layout.
-          client.send({ cmd: "keydbg", key: event.key, sc: event.nativeScanCode, text: event.text })
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
