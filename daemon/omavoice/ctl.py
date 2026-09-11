@@ -75,7 +75,7 @@ def main() -> int:
     ask.add_argument("query", nargs="+")
 
     backend = sub.add_parser("backend", help="switch the local agent")
-    backend.add_argument("name", choices=("hermes", "ollama", "codex", "claude"))
+    backend.add_argument("name", choices=("hermes", "ollama", "groq", "codex", "claude"))
 
     say = sub.add_parser("say", help="make the assistant speak a line (echo testing)")
     say.add_argument("text", nargs="+")
@@ -89,18 +89,18 @@ def main() -> int:
     workspace.add_argument("folder", help="an existing directory")
 
     allow = sub.add_parser("allow", help="let an agent answer by voice")
-    allow.add_argument("name", choices=("hermes", "ollama", "codex", "claude"))
+    allow.add_argument("name", choices=("hermes", "ollama", "groq", "codex", "claude"))
 
     revoke = sub.add_parser("revoke", help="withdraw an agent's permission")
-    revoke.add_argument("name", choices=("hermes", "ollama", "codex", "claude"))
+    revoke.add_argument("name", choices=("hermes", "ollama", "groq", "codex", "claude"))
 
     unrestrict = sub.add_parser(
         "unrestrict", help="let an agent use everything it can, not only the folder"
     )
-    unrestrict.add_argument("name", choices=("hermes", "ollama", "codex", "claude"))
+    unrestrict.add_argument("name", choices=("hermes", "ollama", "groq", "codex", "claude"))
 
     restrict = sub.add_parser("restrict", help="hold an agent to the chosen folder again")
-    restrict.add_argument("name", choices=("hermes", "ollama", "codex", "claude"))
+    restrict.add_argument("name", choices=("hermes", "ollama", "groq", "codex", "claude"))
 
     args = parser.parse_args()
 

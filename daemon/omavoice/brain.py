@@ -78,6 +78,25 @@ _HERMES_TIMEOUT_S = 120
 _OLLAMA_TIMEOUT_S = 90
 _OLLAMA_KEEP_ALIVE = "2h"
 
+# Groq: a free-tier cloud brain — no local RAM cost at all, sub-second first
+# tokens. The key lives in its own file (like the OpenAI key), never in env.
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_TIMEOUT_S = 45
+
+_GROQ_SYSTEM = """\
+You are the brain of a voice assistant. Your answer will be spoken out loud \
+by a text-to-speech voice and shown in a small desktop panel.
+
+Reply with STRICT JSON only, no markdown fences: \
+{"spoken": "...", "markdown": "..."} \
+- spoken: 1-3 short conversational sentences in the user's language. \
+This is what the voice says — no lists, no paths, no URLs read aloud.
+- markdown: optional fuller answer for the panel screen, same language.
+- The person is talking to you by voice; keep every turn brief.
+- You have NO tools. Answer from your own knowledge; if you do not know, \
+say so briefly. (Reply with one JSON object.)\
+"""
+
 log = logging.getLogger("omavoice.brain")
 
 # Phrasings that only make sense as a literal command to run, not as a
@@ -473,7 +492,7 @@ def _read_capped(path: Path, limit: int, what: str) -> str:
 class Brain:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes", "ollama") else "hermes"
+        self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes", "ollama", "groq") else "hermes"
         # One thread per backend, so flipping the switch mid-conversation does
         # not try to resume a codex thread inside claude.
         self._threads: dict[str, str] = {}
@@ -487,15 +506,16 @@ class Brain:
         # field names ("text") or answers in the wrong shape entirely.
         self._hermes_history: list[dict] = [{"role": "system", "content": _HERMES_SYSTEM}]
         self._ollama_history: list[dict] = [{"role": "system", "content": _OLLAMA_SYSTEM}]
+        self._groq_history: list[dict] = [{"role": "system", "content": _GROQ_SYSTEM}]
         self._lock = asyncio.Lock()
         self._on_trace: "Callable[[str], None] | None" = None
 
     # -- lifecycle ----------------------------------------------------------
 
     def set_backend(self, name: str) -> bool:
-        if name not in ("codex", "claude", "hermes", "ollama"):
+        if name not in ("codex", "claude", "hermes", "ollama", "groq"):
             return False
-        if name != "hermes" and name != "ollama" and not shutil.which(name):
+        if name not in ("hermes", "ollama", "groq") and not shutil.which(name):
             log.warning("backend %s is not installed", name)
             return False
         self.backend = name
@@ -506,6 +526,7 @@ class Brain:
         self._threads.clear()
         self._hermes_history = [{"role": "system", "content": _HERMES_SYSTEM}]
         self._ollama_history = [{"role": "system", "content": _OLLAMA_SYSTEM}]
+        self._groq_history = [{"role": "system", "content": _GROQ_SYSTEM}]
 
     def watch(self, on_trace: "Callable[[str], None] | None") -> None:
         """Be told what the agent is doing while it is doing it.
@@ -593,7 +614,7 @@ class Brain:
         bound, and gating them behind it would block every question for no
         reason.
         """
-        if self.backend in ("hermes", "ollama"):
+        if self.backend in ("hermes", "ollama", "groq"):
             return ""
         if self.cfg.brain_cwd is None:
             return ("No folder has been chosen for me to work in yet. "
@@ -630,8 +651,8 @@ class Brain:
 
         if self.backend == "hermes":
             pass  # no binary to check; the gateway is probed on first ask
-        elif self.backend == "ollama":
-            pass  # a local HTTP server, probed on first ask like the gateway
+        elif self.backend in ("ollama", "groq"):
+            pass  # HTTP endpoints, probed on first ask like the gateway
         elif not shutil.which(self.backend):
             return Answer.error(f"The {self.backend} agent is not installed.")
 
@@ -664,6 +685,8 @@ class Brain:
                     return await self._ask_hermes(query)
                 if self.backend == "ollama":
                     return await self._ask_ollama(query)
+                if self.backend == "groq":
+                    return await self._ask_groq(query)
                 return await self._ask_claude(query)
             except asyncio.TimeoutError:
                 # `_run` has already ended the group by the time this is
@@ -834,6 +857,74 @@ class Brain:
             del self._ollama_history[1:3]  # keep system + bounded turns
         answer = _coerce(answer_text)
         self._trace(f"ollama: {answer.spoken[:120]}")
+        return answer
+
+    async def _ask_groq(self, query: str) -> Answer:
+        """Ask Groq — a free cloud brain with no local footprint.
+
+        Same contract as the other backends. Two Groq-specific traps, both
+        measured: (1) Cloudflare in front of api.groq.com rejects the default
+        urllib User-Agent with 403 "error code: 1010" — an explicit UA is
+        mandatory; (2) response_format json_object requires the word "JSON"
+        in the prompt or the API refuses with 400.
+        """
+        import urllib.request
+        import urllib.error
+
+        key_file = Path.home() / ".config" / "omavoice" / "key.groq"
+        try:
+            key = key_file.read_text().strip()
+        except OSError:
+            return Answer.error("No Groq key — put it in ~/.config/omavoice/key.groq")
+        if not key:
+            return Answer.error("The Groq key file is empty.")
+
+        model = os.environ.get("OMAVOICE_GROQ_MODEL", "qwen/qwen3.8-27b")
+        self._groq_history.append({"role": "user", "content": query})
+        body = {
+            "model": model,
+            "messages": self._groq_history,
+            "response_format": {"type": "json_object"},
+            "temperature": 0.3,
+            "max_tokens": 220,
+        }
+        req = urllib.request.Request(
+            _GROQ_URL,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": "omavoice/0.12",
+            },
+            method="POST",
+        )
+        self._trace(f"groq: {query[:120]}")
+        try:
+            def _fetch() -> bytes:
+                with urllib.request.urlopen(req, timeout=_GROQ_TIMEOUT_S) as r:
+                    return r.read()
+
+            raw = await asyncio.to_thread(_fetch)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode(errors="replace")
+            self._groq_history.pop()
+            return Answer.error(f"Groq error {exc.code}: {detail}")
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            self._groq_history.pop()
+            log.warning("groq unreachable: %s", exc)
+            return Answer.error("Groq is not reachable — check the network.")
+
+        try:
+            answer_text = json.loads(raw)["choices"][0]["message"]["content"] or ""
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            self._groq_history.pop()
+            return Answer(spoken=_clip(raw.decode(errors="replace"), _MAX_SPOKEN))
+
+        self._groq_history.append({"role": "assistant", "content": answer_text})
+        if len(self._groq_history) > 16:
+            del self._groq_history[1:3]
+        answer = _coerce(answer_text)
+        self._trace(f"groq: {answer.spoken[:120]}")
         return answer
 
     async def _drain(

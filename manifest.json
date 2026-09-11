@@ -30,7 +30,7 @@
         "type": "enum",
         "label": "Local agent",
         "description": "Who finds the answer: hermes is the local gateway agent (default); ollama is a local LLM on this machine (qwen2.5:3b, no cloud at all); codex and claude remain available if installed.",
-        "options": ["hermes", "ollama", "codex", "claude"],
+        "options": ["hermes", "ollama", "groq", "codex", "claude"],
         "defaultValue": "hermes"
       },
       {

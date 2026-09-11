@@ -169,7 +169,7 @@ BarWidget {
       // The daemon refuses a backend that is not installed, so the worst case
       // is a no-op with a log line, never a broken switch.
       if (b === Qt.MiddleButton) {
-        const order = ["hermes", "ollama", "codex", "claude"]
+        const order = ["hermes", "groq", "ollama", "codex", "claude"]
         client.setBackend(order[(order.indexOf(client.backend) + 1) % order.length])
       }
       else if (b === Qt.RightButton) root.stopListening()
