@@ -200,7 +200,7 @@ Item {
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
-          } else if (root.isKey(event, Qt.Key_V, 47, "м")) {
+          } else if (isKey(event, Qt.Key_V, 47, "м")) {
             // Push-to-talk: V held = mic open, V released = turn committed.
             // The daemon gates the microphone on this signal; the turn ends
             // on release, so endpointing by silence never has to guess.
@@ -209,20 +209,20 @@ Item {
               client.setPtt(true)
             }
             event.accepted = true
-          } else if (root.isKey(event, Qt.Key_I, 23, "ш")) {
+          } else if (isKey(event, Qt.Key_I, 23, "ш")) {
             client.cancel()
             event.accepted = true
-          } else if (root.isKey(event, Qt.Key_Q, 16, "й")) {
+          } else if (isKey(event, Qt.Key_Q, 16, "й")) {
             root.endSession()
             event.accepted = true
-          } else if (root.isKey(event, Qt.Key_N, 49, "т")) {
+          } else if (isKey(event, Qt.Key_N, 49, "т")) {
             client.reset()
             under.forget()
             event.accepted = true
           }
         }
         Keys.onReleased: function (event) {
-          if (root.isKey(event, Qt.Key_V, 47, "м") && client.pttHeld) {
+          if (isKey(event, Qt.Key_V, 47, "м") && client.pttHeld) {
             client.pttHeld = false
             client.setPtt(false)
             event.accepted = true
