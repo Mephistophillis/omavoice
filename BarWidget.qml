@@ -17,6 +17,13 @@ BarWidget {
   moduleName: "io.github.baranskyi.omavoice"
 
   readonly property string voiceState: client.connected ? client.voiceState : "offline"
+  // In push-to-talk mode the microphone is hot only while V is held — a live
+  // session alone must not light the bar's privacy glow ("listening" while
+  // nobody holds the key is exactly the lie this widget exists not to tell).
+  // In automatic mode a live session is a hot mic, as before.
+  readonly property bool micOpen: root.pttMode
+    ? (client.voiceState === "listening" && client.pttHeld)
+    : hues.microphoneIsOpen(root.voiceState)
   readonly property bool showLabel: {
     // Same default as the manifest: without a stored value the fallback here is
     // what actually decides, and a mismatch would leave the setting looking on
@@ -28,11 +35,6 @@ BarWidget {
 
 
   StateHues { id: hues }
-
-  // Whether the microphone is open. Not "is the panel on screen" — hiding the
-  // panel stops nothing, so the bar is the only thing left that can say a
-  // microphone is live, and it had better say it.
-  readonly property bool micOpen: hues.microphoneIsOpen(root.voiceState)
 
   readonly property color barGround: root.bar && root.bar.barBackground
     ? root.bar.barBackground
@@ -86,6 +88,11 @@ BarWidget {
     // listening while the agent was away.
     if (client.pendingSince > 0)
       return root.waitedSeconds > 0 ? "looking " + root.waitedSeconds + "s" : "looking"
+
+    // Push-to-talk: "listening" is the session state, not the mic state —
+    // say what the person can act on (hold V) until the key is actually down.
+    if (root.pttMode && voiceState === "listening")
+      return client.pttHeld ? "listening" : "hold V"
 
     switch (voiceState) {
     case "listening": return "listening"

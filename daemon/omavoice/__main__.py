@@ -1309,7 +1309,10 @@ class Daemon:
         if command == "ptt":
             # Push-to-talk gate: `held` true while the panel's V key is down.
             # The daemon forwards the boundary to the session so the turn is
-            # committed on release, not by a silence clock.
+            # committed on release, not by a silence clock. Broadcast rather
+            # than replied: the bar widget keeps its own socket and its whole
+            # job is saying whether the microphone is hot right now — which
+            # in this mode is exactly "is V held", not "is a session live".
             held = message.get("held") is True
             self._ptt_held = held
             session = self.session
@@ -1318,6 +1321,9 @@ class Daemon:
                     session.begin_utterance()
                 else:
                     session.end_utterance()
+            self.server.broadcast(
+                {"type": "ptt", "held": held, "mode": bool(self.cfg.push_to_talk)}
+            )
             return {"ok": True, "held": held}
 
         if command == "ask":
@@ -1483,6 +1489,12 @@ class Daemon:
         self._level_task = asyncio.create_task(self._level_pump(), name="levels")
         self.server.broadcast({"type": "state", "state": "idle"})
         self.server.broadcast({"type": "backend", "backend": self.brain.backend})
+        # The PTT gate starts closed. Broadcasting it here (not only on the
+        # first key press) means the bar's status light is right from shell
+        # start, and the IPC replay hands the same fact to a late joiner.
+        self.server.broadcast(
+            {"type": "ptt", "held": False, "mode": bool(self.cfg.push_to_talk)}
+        )
         self.server.broadcast({"type": "voice", "voice": self.cfg.voice})
         self.server.broadcast({"type": "key", "hasKey": bool(self.cfg.api_key) or self.cfg.voice_engine == "local"})
         self._broadcast_access()

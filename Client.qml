@@ -41,6 +41,7 @@ Item {
   property var files: []
   property string errorText: ""
   property bool pttHeld: false           // V key held (push-to-talk)
+  property bool pttMode: false           // push-to-talk enabled in the daemon
 
   // --- audio path -----------------------------------------------------------
   // Which microphone the daemon is using, what it could use, and whether the
@@ -217,6 +218,10 @@ Item {
       break
     case "backend":
       root.backend = String(message.backend || root.backend)
+      break
+    case "ptt":
+      root.pttHeld = message.held === true
+      if (message.mode !== undefined) root.pttMode = message.mode === true
       break
     case "voice":
       root.voice = String(message.voice || root.voice)
