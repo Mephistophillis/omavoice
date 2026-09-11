@@ -39,7 +39,7 @@ from .audio import (
     rms_full_scale,
 )
 from .brain import Brain
-from .config import Config
+from .config import Config, _env_flag as _env_flag_or
 from .realtime import RealtimeSession
 from .localvoice import LocalVoiceSession
 
@@ -1300,9 +1300,8 @@ class Daemon:
             if ok:
                 self._save_preferences()
                 self.server.broadcast({"type": "backend", "backend": self.brain.backend})
-                if self.brain.backend == "ollama":
-                    # Switching to a cold local model would put its load time
-                    # into the next question; warm it in the background now.
+                if self.brain.backend == "ollama" and _env_flag_or("OMAVOICE_OLLAMA_WARM", False):
+                    # Opt-in for the same reason as startup warm-up (see run).
                     asyncio.create_task(self._warm_ollama(), name="ollama-warm")
             return {"ok": ok, "backend": self.brain.backend}
 
@@ -1529,9 +1528,13 @@ class Daemon:
             # does not pay the ~70 s load. The session's connect() will find
             # it in the class-level cache and return immediately.
             asyncio.create_task(self._warm_vosk(), name="vosk-warm")
-        if self.brain.backend == "ollama":
-            # Same idea, other organ: the brain's model pays its load here
-            # rather than inside the first spoken question.
+        if self.brain.backend == "ollama" and _env_flag_or("OMAVOICE_OLLAMA_WARM", False):
+            # Same idea, other organ — but OPT-IN on small-RAM machines:
+            # warming vosk (1.2 GB) AND an ollama model (2.2 GB) at daemon
+            # start pushed this box into swap until the OOM killer took the
+            # daemon (measured: 4.4 GB peak + 11.6 GB swap, oom-kill at 3 min
+            # uptime). The first ask pays the load instead; keep_alive pins
+            # the model after that.
             asyncio.create_task(self._warm_ollama(), name="ollama-warm")
 
         # So a panel opened before the first conversation already knows what
