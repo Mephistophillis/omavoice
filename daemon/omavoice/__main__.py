@@ -160,6 +160,11 @@ class Daemon:
             chunk_ms=cfg.chunk_ms,
         )
         self.session: "RealtimeSession | LocalVoiceSession | None" = None
+        # Push-to-talk: True while the panel's V key is held. The mic pump
+        # reads this; the `ptt` IPC command writes it. Reset on every session
+        # teardown — a release event lost to a closing panel must not leave
+        # the gate wedged open for the next one.
+        self._ptt_held = False
 
         # Playback runs on its own task, fed by this queue. Writing to pw-play
         # directly from the socket-reading path meant that whenever the speaker
@@ -418,6 +423,31 @@ class Daemon:
         # audio because the panel is hidden made the panel the point instead of
         # the conversation.
         if not (session and session.connected and self.state in ("listening", "speaking")):
+            return
+
+        # Push-to-talk: the V key is the gate. While held, mic audio flows to
+        # the recognizer unconditionally (a pause inside a hold is just a
+        # pause — the noise gate must not eat quiet speech mid-phrase); while
+        # not held, nothing flows and the recognizer sits idle. The echo guard
+        # still applies: holding V over our own playback without a verified
+        # canceller would transcribe the assistant's voice.
+        from .localvoice import LocalVoiceSession as _LVS
+
+        if self.cfg.push_to_talk and isinstance(session, _LVS):
+            if not self._ptt_held:
+                return
+            room_is_loud = self._room_is_loud()
+            if room_is_loud and not self._allows_voice_interruption():
+                return
+            loudness = rms_full_scale(chunk)
+            self.autogain.observe(loudness, True)
+            chunk = self.autogain.apply(chunk)
+            self._pending_level = max(self._pending_level, level)
+            self._pending_bands = bands
+            if self._dump is not None:
+                self._dump.write(chunk)
+            task = asyncio.create_task(session.send_audio(chunk))
+            task.add_done_callback(_log_task_failure)
             return
 
         # Not "are we in the speaking state" but "is sound still in the room".
@@ -1065,6 +1095,7 @@ class Daemon:
         task, self._session_task = self._session_task, None
         self.backgrounded = False
         self.paused = False
+        self._ptt_held = False  # a lost key-release must not wedge the gate
 
         if not keep_audio:
             await self.mic.stop()
@@ -1274,6 +1305,20 @@ class Daemon:
                     # into the next question; warm it in the background now.
                     asyncio.create_task(self._warm_ollama(), name="ollama-warm")
             return {"ok": ok, "backend": self.brain.backend}
+
+        if command == "ptt":
+            # Push-to-talk gate: `held` true while the panel's V key is down.
+            # The daemon forwards the boundary to the session so the turn is
+            # committed on release, not by a silence clock.
+            held = message.get("held") is True
+            self._ptt_held = held
+            session = self.session
+            if isinstance(session, LocalVoiceSession):
+                if held:
+                    session.begin_utterance()
+                else:
+                    session.end_utterance()
+            return {"ok": True, "held": held}
 
         if command == "ask":
             # Text-only path: no microphone, no speech. This is how

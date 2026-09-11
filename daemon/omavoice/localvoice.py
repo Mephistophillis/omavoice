@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Callable
 
@@ -38,6 +39,11 @@ from .config import Config
 log = logging.getLogger("omavoice.localvoice")
 
 MAX_QUERY_CHARS = 2000
+
+# Sentinel queued after the release silence: when the worker pops it, the
+# turn is committed. Deterministic — counting chunks instead raced with real
+# mic chunks still ahead in the queue.
+_PTT_FLUSH = object()
 
 # edge-tts streams MP3; ffmpeg converts to PCM16 at the daemon's pipeline rate
 # (cfg.sample_rate — 16 kHz in local mode), which is what on_audio expects.
@@ -98,6 +104,11 @@ class LocalVoiceSession:
         self._deliver_final = None
         self._final_tasks: set = set()
         self._drain_task: asyncio.Task | None = None
+        # Push-to-talk state, shared with the recognition thread. `held` says
+        # the mic gate is open (a hold is one turn, pauses inside it do not
+        # end it); `flush_now` asks the worker to commit the turn at once —
+        # set on key release, checked at the top of the worker loop.
+        self._ptt_held_evt = threading.Event()
 
     @property
     def awaiting_first_turn(self) -> bool:
@@ -151,6 +162,36 @@ class LocalVoiceSession:
         # session reuses it. KaldiRecognizer holds no audio of its own.
         self._recognizer = None
         self._model = None
+
+    # -- push-to-talk ---------------------------------------------------------
+
+    def begin_utterance(self) -> None:
+        """V pressed: everything the mic hears until release is ONE turn.
+
+        Called from the daemon's event loop; the events are the only state
+        touched, and they are thread-safe by construction. The recognizer
+        itself is NOT reset here — that would race the worker thread; a fresh
+        turn starts clean because the previous one was flushed on its release.
+        """
+        self._ptt_held_evt.set()
+
+    def end_utterance(self) -> None:
+        """V released: commit the turn now, not when silence would have.
+
+        Vosk commits a final only after its own ~0.5 s internal silence
+        window — but the daemon closes the mic gate the instant the key goes
+        up, so the real audio stream just stops and that window never
+        arrives: the last clause would live on as a low-quality partial
+        forever. So ~0.7 s of synthesized silence is queued for the
+        recognizer to commit properly, followed by a sentinel; when the
+        worker pops the sentinel it commits whatever accumulated as one turn.
+        FIFO order makes this deterministic — no clock, no counting.
+        """
+        self._ptt_held_evt.clear()
+        chunk = bytes(int(self.cfg.sample_rate * self.cfg.channels * 2 * 0.02))
+        for _ in range(35):  # 35 x 20 ms = 0.7 s of digital silence
+            self._audio_q.put_nowait(chunk)
+        self._audio_q.put_nowait(_PTT_FLUSH)
 
     # -- outbound (daemon -> session) ----------------------------------------
 
@@ -227,6 +268,13 @@ class LocalVoiceSession:
         # still evolving); silence that lasts `silence_ms` since the speech
         # actually ENDED (per word timings, not per vosk's late commit) means
         # the person has stopped talking — flush the whole buffer as one turn.
+        #
+        # Push-to-talk replaces the clock with the key: while the hold event
+        # is set, finals accumulate and silence NEVER flushes — a pause inside
+        # the hold is just a pause. Release flushes via _flush_now (see
+        # end_utterance); the synthetic silence it queues lets vosk commit
+        # its pending final first, so the tail of the phrase survives as a
+        # proper final rather than a trailing partial.
         final_parts: list[str] = []
         partial_text = ""
         # `now` minus this is the silence elapsed; anchored to speech end.
@@ -257,13 +305,20 @@ class LocalVoiceSession:
 
         while True:
             pcm = self._audio_q.get()
-            if pcm is None:
-                # Session over: a turn still in the buffer is delivered, not
-                # dropped — the person said it, and vanishing speech is worse
-                # than an abrupt end.
+            if pcm is None or pcm is _PTT_FLUSH:
+                # Session over, or a push-to-talk release: a turn still in
+                # the buffer is delivered, not dropped — the person said it,
+                # and vanishing speech is worse than an abrupt end. The
+                # release silence queued ahead of the sentinel has already
+                # been fed through (FIFO), so vosk has committed its final
+                # and the buffer holds the whole utterance.
                 if final_parts or partial_text:
                     self._flush_turn(final_parts, partial_text, rec)
-                return
+                if pcm is None:
+                    return
+                final_parts = []
+                partial_text = ""
+                continue
             audio_t += len(pcm) / bytes_per_s
 
             # Echo guard: while the assistant is speaking, the mic still runs
@@ -299,15 +354,17 @@ class LocalVoiceSession:
                     # is alive and the turn keeps growing. The clock restarts.
                     partial_text = partial or partial_text
                     last_change = time.monotonic()
-                elif final_parts or partial_text:
+                elif (final_parts or partial_text) and not self._ptt_held_evt.is_set():
                     # Silence while a turn is open: flush once it has lasted
                     # long enough. Measured from the anchored speech end, so
-                    # vosk's commit delay cannot eat into the budget.
+                    # vosk's commit delay cannot eat into the budget. Under a
+                    # PTT hold this arm is dead — the key, not the clock,
+                    # decides when the turn is over.
                     if time.monotonic() - last_change >= silence_s:
                         self._flush_turn(final_parts, partial_text, rec)
                         final_parts = []
                         partial_text = ""
-                else:
+                elif not (final_parts or partial_text):
                     # Idle noise before any speech: nothing to keep, nothing
                     # to flush; do not let phantom partials arm the clock.
                     pass

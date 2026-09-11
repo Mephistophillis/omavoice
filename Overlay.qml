@@ -40,11 +40,11 @@ Item {
     if (client.errorText) return client.errorText
     if (!client.connected) return "Daemon not running"
     switch (client.voiceState) {
-    case "listening": return client.userText ? "Listening…" : "Speak"
+    case "listening": return client.pttHeld ? "Listening…" : "Hold V and speak"
     case "thinking": return "Looking it up"
     case "speaking": return "Answering"
     case "error": return "Error"
-    default: return "Ready"
+    default: return "Hold V to talk"
     }
   }
 
@@ -177,6 +177,15 @@ Item {
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
+          } else if (event.key === Qt.Key_V) {
+            // Push-to-talk: V held = mic open, V released = turn committed.
+            // The daemon gates the microphone on this signal; the turn ends
+            // on release, so endpointing by silence never has to guess.
+            if (!client.pttHeld) {
+              client.pttHeld = true
+              client.setPtt(true)
+            }
+            event.accepted = true
           } else if (event.key === Qt.Key_I) {
             client.cancel()
             event.accepted = true
@@ -186,6 +195,13 @@ Item {
           } else if (event.key === Qt.Key_N) {
             client.reset()
             under.forget()
+            event.accepted = true
+          }
+        }
+        Keys.onReleased: function (event) {
+          if (event.key === Qt.Key_V && client.pttHeld) {
+            client.pttHeld = false
+            client.setPtt(false)
             event.accepted = true
           }
         }

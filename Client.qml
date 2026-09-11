@@ -40,6 +40,7 @@ Item {
   property var links: []
   property var files: []
   property string errorText: ""
+  property bool pttHeld: false           // V key held (push-to-talk)
 
   // --- audio path -----------------------------------------------------------
   // Which microphone the daemon is using, what it could use, and whether the
@@ -157,6 +158,7 @@ Item {
 
   function startSession() { return send({ cmd: "start" }) }
   function stopSession() { return send({ cmd: "stop" }) }
+  function setPtt(held) { return send({ cmd: "ptt", held: held === true }) }
   function background() { return send({ cmd: "background" }) }
   function foreground() { return send({ cmd: "foreground" }) }
   function cancel() { return send({ cmd: "cancel" }) }

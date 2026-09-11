@@ -131,6 +131,13 @@ class Config:
         default_factory=lambda: os.environ.get("OMAVOICE_VOSK_MODEL", "vosk-model-small-ru-0.22")
     )
 
+    # Push-to-talk: the panel's V key opens the mic while held and the turn
+    # ends on release — the key, not a silence clock, decides the boundary.
+    # False restores automatic endpointing (pause ends the turn).
+    push_to_talk: bool = field(
+        default_factory=lambda: _env_flag("OMAVOICE_PUSH_TO_TALK", True)
+    )
+
     def vosk_model_dir(self) -> Path:
         """Where the vosk model lives: $OMAVOICE_DATA/models/<name>."""
         base = Path(os.environ.get("OMAVOICE_DATA")

@@ -104,7 +104,8 @@ OMAVOICE_VOICE_ENGINE=local          # "realtime" returns to the upstream OpenAI
 OMAVOICE_BACKEND=hermes              # hermes | ollama | codex | claude
 OMAVOICE_VOSK_MODEL=vosk-model-ru-0.42
 OMAVOICE_TTS_VOICE=ru-RU-DmitryNeural
-OMAVOICE_SILENCE_MS=1500             # pause that ends a turn
+OMAVOICE_SILENCE_MS=1500             # pause that ends a turn (automatic mode only)
+OMAVOICE_PUSH_TO_TALK=true           # V in the panel = hold to talk; false restores pause-based turns
 # OMAVOICE_HERMES_URL=http://127.0.0.1:8642
 # OMAVOICE_HERMES_MODEL=glm-5.3-flash   # optional, for a gateway with several
 # OMAVOICE_OLLAMA_MODEL=qwen2.5:3b       # local brain, no cloud at all
@@ -113,6 +114,15 @@ OMAVOICE_SILENCE_MS=1500             # pause that ends a turn
 
 The gateway key is read from `~/.hermes/.env` (`API_SERVER_KEY`) at ask time —
 never copied elsewhere.
+
+## Push-to-talk
+
+With `OMAVOICE_PUSH_TO_TALK=true` (the default) the panel opens with SUPER+M
+but does not listen yet: **hold V** while you speak and **release it** when
+the question is done — the release, not a silence timer, commits the turn, so
+pauses inside a hold are just pauses. Automatic endpointing (a sufficiently
+long pause ends the turn) is still there with
+`OMAVOICE_PUSH_TO_TALK=false`.
 
 **The hotkey**, in `~/.config/hypr/bindings.lua`:
 
