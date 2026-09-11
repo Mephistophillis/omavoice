@@ -173,22 +173,31 @@ Item {
         clip: true
         focus: true
         Keys.priority: Keys.BeforeItem
-        // Hotkeys are matched by nativeScanCode — the PHYSICAL key, which is
-        // the same whatever the layout maps it to. Matching Qt.Key_* instead
-        // breaks under a non-Latin layout: the V key with Russian selected
-        // delivers no Qt.Key_V event at all (it is "м" there), so hold-V
-        // silently did nothing until the layout was switched back. Scan codes:
-        // V=55, Q=24, I=31, N=57 (standard AT/evdev codes, xkb-independent).
-        readonly property int scV: 55
-        readonly property int scQ: 24
-        readonly property int scI: 31
-        readonly property int scN: 57
-        function keySc(event) { return event.nativeScanCode || 0 }
+        // Hotkeys must survive layout switching. Three ways to identify the
+        // same physical key, because no single one is reliable here:
+        //   1. Qt.Key_* — works in the Latin layout only; with Russian
+        //      selected the V key delivers a Cyrillic keysym, no Qt.Key_V.
+        //   2. nativeScanCode — layout-independent in theory, but its value
+        //      depends on the platform (X hands out evdev+8, Wayland may
+        //      hand out the raw evdev code, and 0 has been seen), so both
+        //      variants are accepted.
+        //   3. The Cyrillic letter the key types in the Russian layout
+        //      (QWERTY-ЙЦУКЕН: V=м, Q=й, I=ш, N=т) — text matching, which
+        //      covers scan-code-less environments entirely.
+        // The panel takes exclusive keyboard focus, so any keypress arriving
+        // here is aimed at us; false positives are not a concern.
+        function isKey(event, qtKey, evdev, cyr) {
+          if (event.key === qtKey) return true
+          const sc = event.nativeScanCode || 0
+          if (sc === evdev || sc === evdev + 8) return true
+          if (cyr && event.text && event.text.toLowerCase() === cyr) return true
+          return false
+        }
         Keys.onPressed: function (event) {
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
-          } else if (root.keySc(event) === root.scV) {
+          } else if (root.isKey(event, Qt.Key_V, 47, "м")) {
             // Push-to-talk: V held = mic open, V released = turn committed.
             // The daemon gates the microphone on this signal; the turn ends
             // on release, so endpointing by silence never has to guess.
@@ -197,20 +206,20 @@ Item {
               client.setPtt(true)
             }
             event.accepted = true
-          } else if (root.keySc(event) === root.scI) {
+          } else if (root.isKey(event, Qt.Key_I, 23, "ш")) {
             client.cancel()
             event.accepted = true
-          } else if (root.keySc(event) === root.scQ) {
+          } else if (root.isKey(event, Qt.Key_Q, 16, "й")) {
             root.endSession()
             event.accepted = true
-          } else if (root.keySc(event) === root.scN) {
+          } else if (root.isKey(event, Qt.Key_N, 49, "т")) {
             client.reset()
             under.forget()
             event.accepted = true
           }
         }
         Keys.onReleased: function (event) {
-          if (root.keySc(event) === root.scV && client.pttHeld) {
+          if (root.isKey(event, Qt.Key_V, 47, "м") && client.pttHeld) {
             client.pttHeld = false
             client.setPtt(false)
             event.accepted = true
