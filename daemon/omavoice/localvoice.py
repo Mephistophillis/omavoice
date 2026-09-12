@@ -52,11 +52,23 @@ _PTT_FLUSH = object()
 # Conversational turns answered without the brain. Everything else —
 # any fact, any question about files or the world — goes to ask_agent,
 # mirroring the hard rule the original realtime instructions had.
-_CHAT_ONLY = re.compile(
-    r"^(привет|здравствуй|здравствуйте|пока|до связи|спасибо|благодарю"
-    r"|ага|угу|ок(ей)?|хорошо|ладно|понятно|да|нет|что|повтори|стоп)\b",
-    re.IGNORECASE,
-)
+#
+# The match must be on the WHOLE turn, never a prefix: "Привет. Расскажи,
+# когда родился Пушкин?" starts with a greeting but IS a question. The old
+# prefix regex swallowed such turns whole — the transcript arrived, matched
+# ^привет, and the turn died with no brain call and no spoken word (the
+# user heard silence for a minute until the watchdog idled the session).
+_CHAT_WORDS = frozenset((
+    "привет", "здравствуй", "здравствуйте", "пока", "до связи",
+    "спасибо", "благодарю", "ага", "угу", "ок", "окей", "хорошо",
+    "ладно", "понятно", "да", "нет", "что", "повтори", "стоп",
+))
+
+
+def _is_chat_only(text: str) -> bool:
+    """True only when the entire turn is social filler (1-2 words)."""
+    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
+    return 0 < len(words) <= 2 and all(w in _CHAT_WORDS for w in words)
 
 _SENTENCE_END = re.compile(r"[.!?…]\s|$")
 
@@ -475,10 +487,10 @@ class LocalVoiceSession:
             # The daemon judged it not an opening turn; stay quiet.
             return
 
-        # Conversational turns (greeting / thanks / bye) are answered by the
-        # voice layer itself; everything else — every fact, every question —
-        # goes to the brain, exactly like the original's hard rule.
-        if _CHAT_ONLY.match(text):
+        # Conversational turns (a bare greeting / thanks / bye) are answered
+        # by the voice layer itself; everything else — every fact, every
+        # question, even one glued to a greeting — goes to the brain.
+        if _is_chat_only(text):
             short = self._smalltalk(text)
             if short:
                 await self._speak_and_close(short)
@@ -492,6 +504,8 @@ class LocalVoiceSession:
             return "До связи."
         if re.match(r"^спасибо", t):
             return "Пожалуйста."
+        if re.match(r"^(привет|здравствуй|здравствуйте)", t):
+            return "Привет!"
         return ""
 
     async def _speak_and_close(self, text: str) -> None:
