@@ -194,6 +194,23 @@ Item {
           return false
         }
         Keys.onPressed: function (event) {
+          // A pending tool confirmation takes the keyboard over entirely:
+          // Enter runs it, Esc declines it — nothing else may fire while a
+          // destructive-ish action waits for a human decision.
+          if (client.confirmRequest) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              client.replyConfirm(client.confirmRequest.id, true)
+              event.accepted = true
+              return
+            }
+            if (event.key === Qt.Key_Escape) {
+              client.replyConfirm(client.confirmRequest.id, false)
+              event.accepted = true
+              return
+            }
+            event.accepted = true
+            return
+          }
           // Auto-repeat must never reach push-to-talk: a held V that emits
           // synthetic press/release pairs commits the turn over and over, and
           // a whole phrase arrives as one-word fragments ("по", "то"). The
@@ -350,6 +367,96 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             opacity: 0.35
+          }
+        }
+
+        // --- confirm dialog: a tool wants permission -------------------
+        Rectangle {
+          id: confirmCard
+          visible: client.confirmRequest !== null
+          anchors.centerIn: parent
+          width: Math.min(parent.width - Style.space(24), Style.space(420))
+          height: confirmCol.implicitHeight + Style.space(28)
+          radius: Style.cornerRadius
+          color: Color.menu.background
+          border.color: Color.urgent
+          border.width: Style.space(2)
+          opacity: visible ? 1 : 0
+
+          Behavior on opacity { NumberAnimation { duration: 120 } }
+
+          Column {
+            id: confirmCol
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(14)
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(14)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(14)
+            spacing: Style.spacing.sm
+
+            Text {
+              width: parent.width
+              text: client.confirmRequest ? client.confirmRequest.prompt : ""
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            Text {
+              width: parent.width
+              text: client.confirmRequest ? client.confirmRequest.title : ""
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.resolvedFamily
+              font.pixelSize: Style.font.caption
+              opacity: 0.65
+            }
+
+            Row {
+              spacing: Style.spacing.sm
+
+              Rectangle {
+                width: yesLbl.implicitWidth + Style.space(24)
+                height: yesLbl.implicitHeight + Style.space(12)
+                radius: Style.cornerRadius
+                color: Color.accent
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: client.replyConfirm(client.confirmRequest.id, true)
+                }
+                Text {
+                  id: yesLbl
+                  anchors.centerIn: parent
+                  text: "Да (Enter)"
+                  color: Color.background
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+              }
+
+              Rectangle {
+                width: noLbl.implicitWidth + Style.space(24)
+                height: noLbl.implicitHeight + Style.space(12)
+                radius: Style.cornerRadius
+                color: Color.menu.border
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: client.replyConfirm(client.confirmRequest.id, false)
+                }
+                Text {
+                  id: noLbl
+                  anchors.centerIn: parent
+                  text: "Нет (Esc)"
+                  color: Color.menu.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+              }
+            }
           }
         }
 

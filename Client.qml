@@ -42,6 +42,8 @@ Item {
   property string errorText: ""
   property bool pttHeld: false           // V key held (push-to-talk)
   property bool pttMode: false           // push-to-talk enabled in the daemon
+  // A tool asking for confirmation: { id, prompt, title }. Empty = none.
+  property var confirmRequest: null
 
   // --- audio path -----------------------------------------------------------
   // Which microphone the daemon is using, what it could use, and whether the
@@ -182,6 +184,10 @@ Item {
   }
   function askAccess() { return send({ cmd: "access", id: 7 }) }
   function markOnboarded() { return send({ cmd: "onboarded", value: true }) }
+  function replyConfirm(id, granted) {
+    confirmRequest = null
+    return send({ cmd: "confirm_reply", id: id, granted: granted === true })
+  }
 
   function clearConversation() {
     eventModel.clear()
@@ -289,6 +295,19 @@ Item {
       break
     case "error":
       root.errorText = String(message.message || "")
+      break
+    case "confirm_request":
+      // Fresh ask from the daemon; stale replays are ignored by id.
+      root.confirmRequest = {
+        id: Number(message.id) || 0,
+        prompt: String(message.prompt || ""),
+        title: String(message.title || "")
+      }
+      break
+    case "confirm_done":
+      if (root.confirmRequest && Number(message.id) === root.confirmRequest.id) {
+        root.confirmRequest = null
+      }
       break
     }
   }

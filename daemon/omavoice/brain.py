@@ -28,7 +28,7 @@ import re
 import shutil
 import signal
 import tomllib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -81,7 +81,12 @@ _OLLAMA_KEEP_ALIVE = "2h"
 # Groq: a free-tier cloud brain — no local RAM cost at all, sub-second first
 # tokens. The key lives in its own file (like the OpenAI key), never in env.
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-_GROQ_TIMEOUT_S = 45
+_GROQ_TIMEOUT_S = 60
+
+
+async def _decline() -> bool:
+    return False
+
 
 _GROQ_SYSTEM = """\
 You are the brain of a voice assistant. Your answer will be spoken out loud \
@@ -90,11 +95,14 @@ by a text-to-speech voice and shown in a small desktop panel.
 Reply with STRICT JSON only, no markdown fences: \
 {"spoken": "...", "markdown": "..."} \
 - spoken: 1-3 short conversational sentences in the user's language. \
-This is what the voice says — no lists, no paths, no URLs read aloud.
-- markdown: optional fuller answer for the panel screen, same language.
-- The person is talking to you by voice; keep every turn brief.
-- You have NO tools. Answer from your own knowledge; if you do not know, \
-say so briefly. (Reply with one JSON object.)\
+This is what the voice says — no lists, no paths, no URLs read aloud. \
+- markdown: optional fuller answer for the panel screen, same language. \
+- The person is talking to you by voice; keep every turn brief. \
+- You have local tools (clock, status, volume, media, reminder, open_app). \
+When the user asks for an action or local fact, CALL a tool instead of \
+answering from memory; report the tool's result briefly in Russian. \
+For anything you lack a tool for, say so briefly. (Reply with one JSON \
+object after the tools are done.)\
 """
 
 log = logging.getLogger("omavoice.brain")
@@ -491,6 +499,10 @@ def _read_capped(path: Path, limit: int, what: str) -> str:
 
 class Brain:
     def __init__(self, cfg: Config) -> None:
+        # The confirm hook is injected by the daemon: coroutine(prompt, title)
+        # -> bool. Tools classified "confirm" (open_app) ask through the panel
+        # dialog before running; None means "nobody to ask" -> decline.
+        self.confirm_hook: "Callable[[str, str], Awaitable[bool]] | None" = None
         self.cfg = cfg
         self.backend = cfg.backend if cfg.backend in ("codex", "claude", "hermes", "ollama", "groq") else "hermes"
         # One thread per backend, so flipping the switch mid-conversation does
@@ -881,47 +893,118 @@ class Brain:
 
         model = os.environ.get("OMAVOICE_GROQ_MODEL", "qwen/qwen3.8-27b")
         self._groq_history.append({"role": "user", "content": query})
-        body = {
-            "model": model,
-            "messages": self._groq_history,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.3,
-            "max_tokens": 220,
-        }
-        req = urllib.request.Request(
-            _GROQ_URL,
-            data=json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "User-Agent": "omavoice/0.12",
-            },
-            method="POST",
-        )
-        self._trace(f"groq: {query[:120]}")
-        try:
-            def _fetch() -> bytes:
-                with urllib.request.urlopen(req, timeout=_GROQ_TIMEOUT_S) as r:
-                    return r.read()
 
-            raw = await asyncio.to_thread(_fetch)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:200].decode(errors="replace")
-            self._groq_history.pop()
-            return Answer.error(f"Groq error {exc.code}: {detail}")
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            self._groq_history.pop()
-            log.warning("groq unreachable: %s", exc)
-            return Answer.error("Groq is not reachable — check the network.")
+        from . import tools as voice_tools
 
-        try:
-            answer_text = json.loads(raw)["choices"][0]["message"]["content"] or ""
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-            self._groq_history.pop()
-            return Answer(spoken=_clip(raw.decode(errors="replace"), _MAX_SPOKEN))
+        hook = self.confirm_hook
+        confirm = hook if hook is not None else (lambda prompt, title: _decline())
+
+        # Tool loop: let the model call local tools (max 4 rounds), feeding
+        # results back, until it produces a final JSON answer. Every tool_call
+        # MUST get a "tool" role reply — groq rejects the request otherwise.
+        # NOTE: no response_format here — Groq forbids json mode together with
+        # tools ("json mode cannot be combined with tool/function calling");
+        # the system prompt plus _coerce() keep the JSON contract instead.
+        answer_text = ""
+        for _round in range(4):
+            body = {
+                "model": model,
+                "messages": self._groq_history,
+                "temperature": 0.3,
+                "max_tokens": 220,
+            }
+            tool_specs = voice_tools.groq_tools()
+            if tool_specs:
+                body["tools"] = tool_specs
+                body["tool_choice"] = "auto"
+            req = urllib.request.Request(
+                _GROQ_URL,
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "omavoice/0.12",
+                },
+                method="POST",
+            )
+            self._trace(f"groq: {query[:120]}")
+            try:
+                def _fetch() -> bytes:
+                    with urllib.request.urlopen(req, timeout=_GROQ_TIMEOUT_S) as r:
+                        return r.read()
+
+                raw = await asyncio.to_thread(_fetch)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:200].decode(errors="replace")
+                self._groq_history.pop()
+                return Answer.error(f"Groq error {exc.code}: {detail}")
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                self._groq_history.pop()
+                log.warning("groq unreachable: %s", exc)
+                return Answer.error("Groq is not reachable — check the network.")
+
+            try:
+                message = json.loads(raw)["choices"][0]["message"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                self._groq_history.pop()
+                return Answer(spoken=_clip(raw.decode(errors="replace"), _MAX_SPOKEN))
+            answer_text = message.get("content") or ""
+            calls = message.get("tool_calls") or []
+            if not calls:
+                break
+
+            # Record the assistant's tool-call turn, then each result.
+            self._groq_history.append({
+                "role": "assistant",
+                "content": answer_text,
+                "tool_calls": calls,
+            })
+            for call in calls[:3]:
+                name = str((call.get("function") or {}).get("name") or "")
+                args_raw = str((call.get("function") or {}).get("arguments") or "{}")
+                try:
+                    payload = json.loads(args_raw)
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except json.JSONDecodeError:
+                    payload = {}
+                tool = voice_tools.lookup(name)
+                if tool is None:
+                    result = f"нет такого инструмента: {name}"
+                elif not tool.instant and hook is None:
+                    result = "некого спросить о подтверждении — отклонено"
+                elif not tool.instant:
+                    title = f"{name} {json.dumps(payload, ensure_ascii=False)}"
+                    ok = await confirm(f"Выполнить {name}?", title)
+                    if not ok:
+                        self._trace(f"tool declined: {name}")
+                        result = "отклонено пользователем"
+                    else:
+                        self._trace(f"tool confirmed: {name}")
+                        try:
+                            result = await tool.run(payload)
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("tool %s failed", name)
+                            result = f"ошибка инструмента: {exc}"
+                else:
+                    self._trace(f"tool: {name} {args_raw[:80]}")
+                    try:
+                        result = await tool.run(payload)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("tool %s failed", name)
+                        result = f"ошибка инструмента: {exc}"
+                self._groq_history.append({
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or ""),
+                    "content": str(result)[:400],
+                })
 
         self._groq_history.append({"role": "assistant", "content": answer_text})
-        if len(self._groq_history) > 16:
+        # Free-tier Groq allows 7K input tokens/MINUTE and every round resends
+        # the whole history, tool calls included — a long tail of tool rounds
+        # trips the limit on the NEXT question. Keep the tail short.
+        while len(self._groq_history) > 12:
+            # drop the oldest user/assistant/tool pair, keep the system prompt
             del self._groq_history[1:3]
         answer = _coerce(answer_text)
         self._trace(f"groq: {answer.spoken[:120]}")

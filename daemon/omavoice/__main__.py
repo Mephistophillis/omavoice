@@ -66,6 +66,8 @@ _SPEAKING_GATE_MULTIPLIER = 2.6
 # what was getting through and coming back as "Почему ты можешь мне помочь?"
 # a beat after the assistant said "Чем могу помочь?".
 _ECHO_TAIL_SECONDS = 0.9
+# How long a tool-confirmation dialog waits for Enter before auto-declining.
+_CONFIRM_TIMEOUT_S = 45
 
 # The preferences file holds two short names, a folder, three lists of at most
 # two words each and a flag — a few hundred bytes, and the largest one this
@@ -128,6 +130,46 @@ class Daemon:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.brain = Brain(cfg)
+        # Confirm hook: the brain's "confirm" tools call this; it broadcasts a
+        # confirm_request and waits (bounded) for the panel's confirm_reply.
+        # No panel / timeout / daemon stopping -> False -> tool declined.
+        self._confirm_future: asyncio.Future | None = None
+        self._confirm_seq = 0
+
+        async def _confirm(prompt: str, title: str) -> bool:
+            if self._stopping.is_set():
+                return False
+            self._confirm_seq += 1
+            req_id = self._confirm_seq
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._confirm_future = fut
+            self.server.broadcast({
+                "type": "confirm_request",
+                "id": req_id,
+                "prompt": prompt,
+                "title": title,
+            })
+            self._emit("confirm", title[:100])
+            try:
+                return await asyncio.wait_for(fut, timeout=_CONFIRM_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.info("confirm %s timed out -> declined", name_of(title))
+                return False
+            finally:
+                if self._confirm_future is fut:
+                    self._confirm_future = None
+                # A late/second panel must not arm a dialog for an ask that is
+                # already resolved: confirm_done overwrites the replayed
+                # confirm_request in the server's _latest.
+                self.server.broadcast({
+                    "type": "confirm_done", "id": req_id,
+                })
+
+        def name_of(title: str) -> str:
+            return title.split(" ", 1)[0] if title else "?"
+
+        self.brain.confirm_hook = _confirm
         self.server = ipc.Server(cfg.socket_path, self._on_command)
 
         self.speaker = Speaker(cfg, on_level=self._on_output_level)
@@ -1345,6 +1387,14 @@ class Daemon:
             # omavoice-ctl exercises the brain on its own.
             answer = await self.ask_brain(str(message.get("query") or ""))
             return {"ok": True, "spoken": answer.spoken, **answer.as_ui_payload()}
+
+        if command == "confirm_reply":
+            # Answer to a confirm_request the daemon broadcast: the panel's
+            # dialog resolved (Enter = run, Esc = decline, or timed out).
+            fut = self._confirm_future
+            if fut is not None and not fut.done():
+                fut.set_result(message.get("granted") is True)
+            return {"ok": True}
 
         if command == "say":
             # Debug handle: make the assistant speak a specific line, so echo
