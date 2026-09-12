@@ -153,8 +153,11 @@ Item {
     BorderSurface {
       id: card
       anchors.horizontalCenter: parent.horizontalCenter
-      anchors.top: parent.top
-      anchors.topMargin: Style.space(64)
+      // Anchored BOTTOM: the 3-finger-down gesture opens this panel, so it
+      // rises from the bottom edge — the mirror of the workspace overview's
+      // top strip (3-finger-up). Kept clear of the bar at the top.
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: Style.space(64)
       width: Style.space(560)
       height: Math.min(
         Style.space(620),
