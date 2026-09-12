@@ -112,6 +112,30 @@ object after the tools are done.)\
 
 log = logging.getLogger("omavoice.brain")
 
+# One-line Russian labels for the live activity line in the panel. The trace
+# stream is what the panel shows while a turn runs; a tool id reads as noise
+# there, a human phrase reads as "this is what is taking the time".
+_TOOL_RU = {
+    "clock": "смотрю на часы",
+    "status": "проверяю систему",
+    "volume": "меняю громкость",
+    "media": "медиа",
+    "reminder": "ставлю напоминание",
+    "open_app": "открываю",
+    "browser_search": "открываю поиск",
+    "windows": "смотрю окна",
+    "focus_window": "переключаю окно",
+    "close_window": "закрываю окно",
+    "move_window": "переношу окно",
+    "workspace": "переключаю стол",
+    "browser_control": "управляю браузером",
+    "brightness": "меняю яркость",
+    "note_add": "пишу заметку",
+    "note_read": "читаю заметку",
+    "note_list": "смотрю список заметок",
+    "web_answer": "ищу в интернете",
+}
+
 # Phrasings that only make sense as a literal command to run, not as a
 # question. Voice adds its own transcription errors on top of however loosely
 # a person phrases things, and the sandbox is read-only anyway — but a request
@@ -985,14 +1009,14 @@ class Brain:
                         self._trace(f"tool declined: {name}")
                         result = "отклонено пользователем"
                     else:
-                        self._trace(f"tool confirmed: {name}")
+                        self._trace(f"инструмент: {_TOOL_RU.get(name, name)}…")
                         try:
                             result = await tool.run(payload)
                         except Exception as exc:  # noqa: BLE001
                             log.exception("tool %s failed", name)
                             result = f"ошибка инструмента: {exc}"
                 else:
-                    self._trace(f"tool: {name} {args_raw[:80]}")
+                    self._trace(f"инструмент: {_TOOL_RU.get(name, name)}…")
                     try:
                         result = await tool.run(payload)
                     except Exception as exc:  # noqa: BLE001

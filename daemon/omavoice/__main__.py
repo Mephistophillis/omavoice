@@ -1561,6 +1561,15 @@ class Daemon:
         )
         self.server.broadcast({"type": "voice", "voice": self.cfg.voice})
         self.server.broadcast({"type": "key", "hasKey": bool(self.cfg.api_key) or self.cfg.voice_engine == "local"})
+        # Caps line: which ears the daemon actually runs. The panel shows it
+        # small in the footer; a swapped STT engine (handy vs vosk) reads as
+        # "the assistant got worse at Russian", and this line is how a person
+        # tells a config change from a regression.
+        self.server.broadcast({
+            "type": "caps",
+            "stt": getattr(self.cfg, "stt_engine", "vosk"),
+            "engine": self.cfg.voice_engine,
+        })
         self._broadcast_access()
         # The catalogue lives in one place — here — so the panel never has a
         # stale copy of which voices exist or which gender each speaks in.

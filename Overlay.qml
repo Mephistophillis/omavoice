@@ -36,6 +36,28 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "io.github.baranskyi.omavoice"
 
+  // Human phrasing for tool confirmations. The daemon sends the tool id and
+  // its raw arguments; showing JSON to a person who is being asked a yes/no
+  // question is asking them to parse a program instead of deciding.
+  function describeConfirm(title) {
+    const t = String(title || "")
+    let m = t.match(/^(\w+)\s*(\{.*\})?\s*$/)
+    if (!m) return t
+    const name = m[1]
+    let args = {}
+    try { if (m[2]) args = JSON.parse(m[2]) } catch (e) { return t }
+    switch (name) {
+    case "open_app": return "Открыть " + (args.target || "приложение") + "?"
+    case "browser_search": return "Открыть поиск: " + (args.query || "") + "?"
+    case "focus_window": return "Переключиться на окно?"
+    case "close_window": return "Закрыть это окно?"
+    case "move_window": return "Перенести окно на стол " + (args.workspace || "?") + "?"
+    case "workspace": return "Переключить на стол " + (args.number || "?") + "?"
+    case "browser_control": return "Отправить команду браузеру (" + (args.action || "") + ")?"
+    default: return "Выполнить " + name + "?"
+    }
+  }
+
   readonly property string statusText: {
     if (client.errorText) return client.errorText
     if (!client.connected) return "Daemon not running"
@@ -47,6 +69,21 @@ Item {
     default: return "Hold V to talk"
     }
   }
+
+  // The clock that makes a long turn readable as work. Reuses the bar's rule:
+  // count only while a question is out, and a moving number buys a lot of
+  // patience compared to a still panel.
+  property real now: 0
+  Timer {
+    interval: 1000
+    repeat: true
+    running: client.pendingSince > 0
+    triggeredOnStart: true
+    onTriggered: root.now = Date.now()
+  }
+  readonly property int waitedSeconds: client.pendingSince > 0
+    ? Math.max(0, Math.round((root.now - client.pendingSince) / 1000))
+    : 0
 
   function open(payloadJson) {
     root.opened = true
@@ -94,7 +131,13 @@ Item {
     // Felt, not read: the figure buzzes the moment the assistant is talked
     // over, before the state has caught up.
     onBarged: wave.bargeIn()
-    onTraced: function (text) { under.push(text) }
+    // The trace stream feeds the faint working behind the figure AND the
+    // activity line under the status: the same line, read two ways.
+    onTraced: function (text) {
+      under.push(text)
+      if (text.indexOf("инструмент:") === 0 || text.indexOf("ищу") === 0)
+        client.activityText = text
+    }
     onConnectedChanged: {
       if (connected && root.opened) {
         startSession()
@@ -319,44 +362,82 @@ Item {
           // --- status line ----------------------------------------------
           Item {
             width: parent.width
-            height: statusText.implicitHeight
+            height: statusRow.implicitHeight + (activityRow.visible ? activityRow.implicitHeight + Style.spacing.sm : 0)
 
-            Rectangle {
-              id: statusDot
+            Column {
+              id: statusRow
               anchors.left: parent.left
-              anchors.top: parent.top
-              anchors.topMargin: Math.round((statusText.implicitHeight - height) / 2)
-              width: Style.space(8)
-              height: Style.space(8)
-              radius: width / 2
-              color: client.voiceState === "listening" ? Color.accent
-                   : client.voiceState === "error" || !client.connected ? Color.urgent
-                   : Color.menu.text
-              opacity: client.voiceState === "idle" ? 0.4 : 1
-
-              SequentialAnimation on opacity {
-                running: client.voiceState === "listening"
-                loops: Animation.Infinite
-                NumberAnimation { to: 0.35; duration: 700; easing.type: Easing.InOutQuad }
-                NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
-              }
-            }
-
-            Text {
-              id: statusText
-              anchors.left: statusDot.right
-              anchors.leftMargin: Style.spacing.sm
               anchors.right: parent.right
-              anchors.top: parent.top
-              text: root.statusText
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              maximumLineCount: 3
-              elide: Text.ElideRight
-              color: client.voiceState === "error" || !client.connected ? Color.urgent : Color.menu.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              opacity: 0.9
+              spacing: Style.spacing.sm
+
+              Row {
+                spacing: Style.spacing.sm
+
+                Rectangle {
+                  id: statusDot
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(8)
+                  height: Style.space(8)
+                  radius: width / 2
+                  color: client.voiceState === "listening" ? Color.accent
+                       : client.voiceState === "error" || !client.connected ? Color.urgent
+                       : Color.menu.text
+                  opacity: client.voiceState === "idle" ? 0.4 : 1
+
+                  SequentialAnimation on opacity {
+                    running: client.voiceState === "listening"
+                    loops: Animation.Infinite
+                    NumberAnimation { to: 0.35; duration: 700; easing.type: Easing.InOutQuad }
+                    NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
+                  }
+                }
+
+                Text {
+                  id: statusText
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: statusRow.width - statusDot.width - Style.spacing.sm - waitedChip.visible * (waitedChip.width + Style.spacing.sm)
+                  text: root.statusText
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  maximumLineCount: 3
+                  elide: Text.ElideRight
+                  color: client.voiceState === "error" || !client.connected ? Color.urgent : Color.menu.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                  opacity: 0.9
+                }
+
+                // The elapsed chip: 3s, 12s… It converts "the panel froze"
+                // into "it has been N seconds", which is the difference
+                // between distrust and patience.
+                Text {
+                  id: waitedChip
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: client.waiting && root.waitedSeconds > 0
+                  text: root.waitedSeconds + " с"
+                  color: Color.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  opacity: 0.9
+                }
+              }
+
+              // The live activity line: what the brain is doing right now
+              // ("ищу в интернете…"), fed by the daemon's trace stream.
+              Text {
+                id: activityRow
+                width: parent.width
+                visible: client.waiting && client.activityText !== ""
+                text: client.activityText
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+                color: Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                opacity: 0.85
+              }
             }
           }
         }
@@ -367,7 +448,7 @@ Item {
           anchors.bottom: parent.bottom
           anchors.left: parent.left
           anchors.right: parent.right
-          height: hint.implicitHeight
+          height: hint.implicitHeight + (capsLine.visible ? capsLine.implicitHeight + Style.spacing.xs : 0)
 
           Text {
             id: hint
@@ -381,6 +462,27 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             opacity: 0.35
+          }
+
+          // What is actually under the hood, one small line: the brain on the
+          // left, the ears on the right. A swapped backend or STT engine is
+          // otherwise invisible until the answers change character.
+          Text {
+            id: capsLine
+            width: parent.width
+            visible: client.connected
+            text: {
+              const parts = []
+              if (client.backend) parts.push(client.backend)
+              if (client.sttEngine) parts.push(client.sttEngine === "handy" ? "GigaAM" : "vosk")
+              return parts.join(" · ")
+            }
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: Color.menu.text
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            opacity: 0.25
           }
         }
 
@@ -402,6 +504,50 @@ Item {
             id: middle
             width: scroller.width
             spacing: Style.spacing.panelGap
+
+            // Earlier turns of this session, oldest first, dimmer than the
+            // live exchange. The panel used to forget every turn but the
+            // last; a conversation you cannot scroll back through is not a
+            // conversation.
+            Repeater {
+              model: Math.max(0, client.turns.length - 1)
+
+              delegate: Column {
+                width: middle.width
+                spacing: Style.spacing.sm
+
+                Text {
+                  width: parent.width
+                  text: client.turns[index] ? client.turns[index].user : ""
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  color: Color.menu.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  opacity: 0.35
+                  visible: text !== ""
+                }
+                Text {
+                  width: parent.width
+                  text: client.turns[index] ? client.turns[index].answer : ""
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  elide: Text.ElideRight
+                  maximumLineCount: 3
+                  color: Color.menu.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  opacity: 0.45
+                  visible: text !== ""
+                }
+              }
+            }
+
+            // The newest archived turn gets a separator before the live one.
+            PanelSeparator {
+              width: parent.width
+              visible: client.turns.length > 0
+            }
 
             // What the ears heard, above the answer: the transcription is the
             // half of the conversation that can silently go wrong (a missed
@@ -515,7 +661,9 @@ Item {
 
             Text {
               width: parent.width
-              text: client.confirmRequest ? client.confirmRequest.prompt : ""
+              text: client.confirmRequest
+                ? root.describeConfirm(client.confirmRequest.title)
+                : ""
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               color: Color.menu.text
@@ -525,13 +673,22 @@ Item {
 
             Text {
               width: parent.width
-              text: client.confirmRequest ? client.confirmRequest.title : ""
+              visible: text !== ""
+              text: {
+                // The raw tool call, for the rare case the human phrasing is
+                // not enough. Dim and small, below the question, never above.
+                const t = String(client.confirmRequest ? client.confirmRequest.title : "")
+                const m = t.match(/^(\w+)\s*(\{.*\})?\s*$/)
+                return m && m[2] ? m[1] + " " + m[2] : ""
+              }
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
+              elide: Text.ElideRight
+              maximumLineCount: 2
               color: Color.menu.text
               font.family: Style.font.resolvedFamily
               font.pixelSize: Style.font.caption
-              opacity: 0.65
+              opacity: 0.4
             }
 
             Row {

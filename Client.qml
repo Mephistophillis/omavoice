@@ -87,6 +87,18 @@ Item {
   // window onto something that is still running.
   signal traced(string text)
 
+  // The last activity line, kept while the turn runs: the status row shows it
+  // under the clock so a long tool turn reads as work, not as a hang.
+  property string activityText: ""
+
+  // The conversation as turn pairs, newest at the end. The panel used to show
+  // only the last exchange; a voice session is a conversation and scrolling
+  // back one screen is the least it owes.
+  property var turns: []
+
+  // Which ears/brain are actually running, from the daemon's caps broadcast.
+  property string sttEngine: ""
+
   // The waterfall. Newest first, because the interesting line is always the
   // one that just happened, and it should not move once it has been read.
   property alias events: eventModel
@@ -131,8 +143,10 @@ Item {
     if (kind === "agent") {
       const age = Date.now() / 1000 - (Number(message.at) || 0)
       root.pendingSince = age >= 0 && age < 5 ? Date.now() : 0
+      if (root.pendingSince > 0) root.activityText = "думаю…"
     } else if (kind === "result" || kind === "error" || kind === "stop") {
       root.pendingSince = 0
+      root.activityText = ""
     }
 
     eventModel.insert(0, {
@@ -199,6 +213,8 @@ Item {
     links = []
     files = []
     errorText = ""
+    activityText = ""
+    turns = []
   }
 
   // --- inbound --------------------------------------------------------------
@@ -284,6 +300,10 @@ Item {
       // panel's own note, never as the user's line.
       root.queryText = String(message.text || "")
       break
+    case "caps":
+      // Which engine/STT actually runs. Small footer context, not a nag.
+      root.sttEngine = String(message.stt || "")
+      break
     case "trace":
       root.traced(String(message.text || ""))
       break
@@ -291,6 +311,15 @@ Item {
       root.markdown = String(message.markdown || "")
       root.links = Array.isArray(message.links) ? message.links : []
       root.files = Array.isArray(message.files) ? message.files : []
+      // Archive the finished exchange before the panel moves on. Keep it a
+      // plain value copy so QML bindings see the change.
+      if (root.userText !== "" || root.assistantText !== "") {
+        root.turns = root.turns.concat([{
+          user: root.userText,
+          answer: root.assistantText,
+          markdown: root.markdown
+        }]).slice(-8)
+      }
       root.answered()
       break
     case "error":

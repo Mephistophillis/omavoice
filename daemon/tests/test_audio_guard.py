@@ -18,7 +18,7 @@ class AudioGuardTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.daemon = Daemon.__new__(Daemon)
         d = self.daemon
-        d.cfg = SimpleNamespace(debug=False, chunk_ms=20)
+        d.cfg = SimpleNamespace(debug=False, chunk_ms=20, push_to_talk=False)
         d.session = SimpleNamespace(connected=True, send_audio=AsyncMock())
         d.devices = Devices("mic", "speakers", False, "no AEC")
         d.mic = SimpleNamespace(target="mic", stop=AsyncMock())
