@@ -747,7 +747,45 @@ class Daemon:
             files=len(answer.files),
         )
         self.server.broadcast(answer.as_ui_payload())
+        self._archive_turn(query, answer)
         return answer
+
+    def _archive_turn(self, query: str, answer) -> None:
+        """Append the exchange to the day's history file.
+
+        Voice conversations otherwise evaporate with the panel. One markdown
+        file per day under the state dir; failures are logged and swallowed —
+        archiving must never take a turn down with it.
+        """
+        import datetime
+        try:
+            day = datetime.date.today()
+            d = Path.home() / ".local" / "state" / "omavoice" / "history"
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"{day:%Y-%m-%d}.md"
+            stamp = datetime.datetime.now().strftime("%H:%M")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n## {stamp}\n\n**Я:** {query}\n\n"
+                         f"**Ассистент:** {answer.spoken}\n")
+                if answer.markdown and answer.markdown != answer.spoken:
+                    fh.write(f"\n{answer.markdown}\n")
+        except OSError as exc:
+            log.warning("history archive failed: %s", exc)
+
+    def _history_tail(self, lines: int = 40) -> str:
+        """The tail of the most recent day's history, for the panel's H view."""
+        d = Path.home() / ".local" / "state" / "omavoice" / "history"
+        if not d.is_dir():
+            return ""
+        days = sorted(d.glob("*.md"))
+        for path in reversed(days):
+            try:
+                content = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            if content:
+                return "\n".join(content[-lines:])
+        return ""
 
     # How long a session may say nothing at all before we stop believing in it.
     #
@@ -1286,6 +1324,57 @@ class Daemon:
                     return result
             self._emit("reset", "new conversation")
             return {"ok": True, "restarted": was_live}
+
+        if command == "history":
+            # The panel's H view: the tail of today's (or the last day with
+            # anything in it) archived conversation.
+            return {"ok": True, "text": self._history_tail(60)}
+
+        if command == "open_link":
+            # A link chip clicked in the panel. Reuses the same allow-list the
+            # voice open_app tool goes through, so a click can never open more
+            # than a spoken command could.
+            from . import tools as voice_tools
+            url = str(message.get("url") or "").strip()
+            if not voice_tools._resolve_url(url):
+                return {"ok": False, "error": "not an allowed URL"}
+            await voice_tools._run(["omarchy", "launch", "browser", url], timeout=8)
+            return {"ok": True, "url": url}
+
+        if command == "dashboard":
+            # Idle-time snapshot for the panel: the things a person glances at
+            # without talking. Assembled from the same INSTANT tools the brain
+            # uses, so the panel never shows a fact the voice could contradict.
+            from . import tools as voice_tools
+
+            async def _safe(name: str, payload: dict | None = None) -> str:
+                try:
+                    tool = voice_tools.lookup(name)
+                    if tool is None:
+                        return ""
+                    return await tool.run(payload or {})
+                except Exception:  # noqa: BLE001 — dashboard must never crash
+                    return ""
+
+            clock = await _safe("clock")
+            status = await _safe("status")
+            reminders = ""
+            try:
+                out = await voice_tools._run(
+                    ["omarchy", "reminder", "show", "--json"], timeout=4)
+                reminders = str(out).strip()
+            except Exception:  # noqa: BLE001
+                reminders = ""
+            note = await _safe("note_read", {"note": "покупки"})
+            return {
+                "ok": True,
+                "clock": clock,
+                "status": status,
+                "reminders": reminders,
+                "note": note,
+                "backend": self.brain.backend,
+                "stt": getattr(self.cfg, "stt_engine", "vosk"),
+            }
 
         if command == "cancel":
             # Shut the assistant up without ending the conversation.

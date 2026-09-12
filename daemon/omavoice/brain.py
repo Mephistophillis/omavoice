@@ -93,10 +93,13 @@ You are the brain of a voice assistant. Your answer will be spoken out loud \
 by a text-to-speech voice and shown in a small desktop panel.
 
 Reply with STRICT JSON only, no markdown fences: \
-{"spoken": "...", "markdown": "..."} \
+{"spoken": "...", "markdown": "...", "followups": ["...", "..."]} \
 - spoken: 1-3 short conversational sentences in the user's language. \
 This is what the voice says — no lists, no paths, no URLs read aloud. \
 - markdown: optional fuller answer for the panel screen, same language. \
+- followups: REQUIRED. Exactly 2 short follow-up questions the user might \
+ask next, same language, each under 8 words, never spoken. The JSON is \
+invalid without a non-empty followups array. \
 - The person is talking to you by voice; keep every turn brief. \
 - You have local tools for clock, status, volume, media, reminders, apps, \
 browser search/navigation/tabs/zoom/scroll, window listing/focus/close/move, \
@@ -212,18 +215,22 @@ class Answer:
     markdown: str = ""
     links: list[dict] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
+    followups: list[str] = field(default_factory=list)
 
     @classmethod
     def error(cls, message: str) -> "Answer":
         return cls(spoken=message, markdown="")
 
     def as_ui_payload(self) -> dict:
-        return {
+        payload = {
             "type": "answer",
             "markdown": self.markdown,
             "links": self.links,
             "files": self.files,
         }
+        if self.followups:
+            payload["followups"] = self.followups
+        return payload
 
 
 def _coerce(raw: str) -> Answer:
@@ -289,9 +296,19 @@ def _coerce(raw: str) -> Answer:
         spoken = _clip(re.sub(r"[#*`>\-]", " ", markdown).strip() or "Done.", _MAX_SPOKEN)
     links = _entries("links", "url")
     files = _entries("files", "path")
+    # Follow-up chips: two short questions the person might ask next. Never
+    # spoken, panel-only; strictly capped because they render as rows.
+    followups: list[str] = []
+    raw_followups = data.get("followups")
+    if isinstance(raw_followups, list):
+        for item in raw_followups[:3]:
+            s = " ".join(str(item).split()).strip()
+            if 2 <= len(s) <= 80:
+                followups.append(s)
     if len(text) > _MAX_MARKDOWN + _MAX_SPOKEN:
         log.warning("the agent returned %d bytes of answer — trimmed to fit", len(text))
-    return Answer(spoken=spoken, markdown=markdown, links=links, files=files)
+    return Answer(spoken=spoken, markdown=markdown, links=links, files=files,
+                  followups=followups)
 
 
 # How long the agent's process group gets between the signal it may refuse and

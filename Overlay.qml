@@ -90,12 +90,23 @@ Item {
   // reads as broken, even when the daemon already did the right thing.
   Timer { id: flashTimer; interval: 1200; repeat: false }
 
+  // The dashboard is a glance, not a monitor: once a minute is plenty, and it
+  // stops when the panel closes (started/stopped in open/dismiss).
+  Timer {
+    id: dashTimer
+    interval: 60000
+    repeat: true
+    onTriggered: client.refreshDashboard()
+  }
+
   function open(payloadJson) {
     root.opened = true
     client.wanted = true
     if (!client.connected || !client.backgrounded) client.clearConversation()
     client.startSession()
     client.foreground()
+    client.refreshDashboard()
+    dashTimer.start()
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
@@ -115,6 +126,8 @@ Item {
     root.opened = false
     client.background()
     client.wanted = false
+    dashTimer.stop()
+    client.historyMode = false
     if (shell && typeof shell.hide === "function") shell.hide(root.pluginId)
   }
 
@@ -304,6 +317,10 @@ Item {
             client.reset()
             under.forget()
             event.accepted = true
+          } else if (isKey(event, Qt.Key_H, 43, "р")) {
+            client.historyMode = !client.historyMode
+            if (client.historyMode) client.fetchHistory()
+            event.accepted = true
           }
         }
         Keys.onReleased: function (event) {
@@ -462,7 +479,7 @@ Item {
             anchors.top: parent.top
             anchors.left: parent.left
             text: client.connected
-              ? "Esc — background · I — interrupt · N — new · Q — stop"
+              ? "Esc — background · I — interrupt · N — new · H — history · Q — stop"
               : "Start the daemon:  systemctl --user start omavoice"
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -515,6 +532,147 @@ Item {
             id: middle
             width: scroller.width
             spacing: Style.spacing.panelGap
+
+            // --- H view: the archived tail of past conversations ---------
+            Text {
+              width: parent.width
+              visible: client.historyMode
+              text: client.historyText === "" ? "История пуста" : client.historyText
+              textFormat: Text.MarkdownText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.resolvedFamily
+              font.pixelSize: Style.font.caption
+              opacity: 0.75
+            }
+
+            // --- idle dashboard: the glance before the first word ---------
+            Column {
+              width: parent.width
+              spacing: Style.spacing.sm
+              visible: !client.historyMode
+                       && client.dashboard !== null
+                       && client.turns.length === 0
+                       && client.userText === "" && client.assistantText === ""
+                       && client.followups.length === 0
+
+              Text {
+                width: parent.width
+                text: client.dashboard && client.dashboard.clock ? client.dashboard.clock : ""
+                textFormat: Text.PlainText
+                color: Color.menu.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                opacity: 0.9
+                visible: text !== ""
+              }
+              Text {
+                width: parent.width
+                text: {
+                  if (!client.dashboard) return ""
+                  const parts = []
+                  if (client.dashboard.status) parts.push(client.dashboard.status)
+                  return parts.join("\n")
+                }
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+                color: Color.menu.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                opacity: 0.55
+                visible: text !== ""
+              }
+              Text {
+                width: parent.width
+                text: {
+                  if (!client.dashboard || !client.dashboard.note
+                      || client.dashboard.note === "такой заметки нет") return ""
+                  const lines = String(client.dashboard.note).split("\n")
+                  return "Список: " + lines[lines.length - 1].replace(/^-\s*\[[^\]]*\]\s*/, "")
+                }
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+                color: Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                opacity: 0.8
+                visible: text !== ""
+              }
+            }
+
+            // --- follow-up chips: the questions the brain suggests --------
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+              visible: client.followups.length > 0 && !client.historyMode
+
+              Repeater {
+                model: client.followups
+
+                delegate: Rectangle {
+                  radius: height / 2
+                  color: Color.menu.border
+                  opacity: 0.8
+                  width: chipText.implicitWidth + Style.space(20)
+                  height: chipText.implicitHeight + Style.space(8)
+
+                  Text {
+                    id: chipText
+                    anchors.centerIn: parent
+                    text: modelData
+                    color: Color.menu.text
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: client.askText(modelData)
+                  }
+                }
+              }
+            }
+
+            // --- link chips: answers often carry one useful source --------
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+              visible: client.links.length > 0 && !client.historyMode
+
+              Repeater {
+                model: client.links
+
+                delegate: Rectangle {
+                  radius: height / 2
+                  color: Color.menu.border
+                  opacity: 0.8
+                  width: linkText.implicitWidth + Style.space(20)
+                  height: linkText.implicitHeight + Style.space(8)
+
+                  Text {
+                    id: linkText
+                    anchors.centerIn: parent
+                    text: "↗ " + (modelData.label || modelData.url)
+                    elide: Text.ElideRight
+                    maximumLineCount: 1
+                    color: Color.accent
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: client.openLink(modelData.url)
+                  }
+                }
+              }
+            }
 
             // Earlier turns of this session, oldest first, dimmer than the
             // live exchange. The panel used to forget every turn but the

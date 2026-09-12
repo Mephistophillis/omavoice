@@ -99,6 +99,51 @@ Item {
   // Which ears/brain are actually running, from the daemon's caps broadcast.
   property string sttEngine: ""
 
+  // --- id-correlated requests (dashboard, history, open_link) -------------
+  property int _reqSeq: 1
+  property var _pendingReplies: ({})
+
+  function request(cmd, args, cb) {
+    const id = root._reqSeq++
+    const payload = Object.assign({ cmd: cmd, id: id }, args || {})
+    if (cb) root._pendingReplies[id] = cb
+    send(payload)
+  }
+
+  // The idle glance: clock, status, reminders, the shopping note. Refreshed
+  // by the panel while it sits open with nothing to say.
+  property var dashboard: null
+  function refreshDashboard() {
+    request("dashboard", {}, function (m) {
+      if (m.ok) root.dashboard = m
+    })
+  }
+
+  // Follow-up chips from the last answer (panel-only, never spoken).
+  property var followups: []
+
+  // The archived tail of past conversations (the H view).
+  property string historyText: ""
+  property bool historyMode: false
+  function fetchHistory() {
+    request("history", {}, function (m) {
+      root.historyText = String(m.text || "")
+    })
+  }
+
+  // A chip was clicked: ask the brain the typed way — the answer arrives as
+  // the usual answer broadcast and lands in the panel.
+  function askText(query) {
+    userText = query
+    assistantText = ""
+    markdown = ""
+    request("ask", { query: query }, function () {})
+  }
+
+  function openLink(url) {
+    request("open_link", { url: url }, function () {})
+  }
+
   // The waterfall. Newest first, because the interesting line is always the
   // one that just happened, and it should not move once it has been read.
   property alias events: eventModel
@@ -229,6 +274,16 @@ Item {
     }
     if (!message || typeof message !== "object") return
 
+    // A correlated reply to a request() we sent (dashboard/history/…): these
+    // carry our id and no broadcast type.
+    const rid = Number(message.id) || 0
+    if (rid && root._pendingReplies[rid]) {
+      const cb = root._pendingReplies[rid]
+      delete root._pendingReplies[rid]
+      cb(message)
+      return
+    }
+
     switch (message.type) {
     case "state":
       root.voiceState = String(message.state || "idle")
@@ -281,6 +336,7 @@ Item {
           root.markdown = ""
           root.links = []
           root.files = []
+          root.followups = []
         }
       } else {
         // The assistant's arrives as deltas until `final`.
@@ -311,6 +367,7 @@ Item {
       root.markdown = String(message.markdown || "")
       root.links = Array.isArray(message.links) ? message.links : []
       root.files = Array.isArray(message.files) ? message.files : []
+      root.followups = Array.isArray(message.followups) ? message.followups : []
       // Archive the finished exchange before the panel moves on. Keep it a
       // plain value copy so QML bindings see the change.
       if (root.userText !== "" || root.assistantText !== "") {
