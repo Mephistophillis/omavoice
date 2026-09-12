@@ -1532,10 +1532,13 @@ class Daemon:
         log.info("ready (backend=%s, key=%s, engine=%s)",
                  self.brain.backend, "yes" if self.cfg.api_key else "NO",
                  self.cfg.voice_engine)
-        if self.cfg.voice_engine == "local":
+        if self.cfg.voice_engine == "local" and getattr(self.cfg, "stt_engine", "vosk") != "handy":
             # Warm the vosk model in the background so the first panel open
             # does not pay the ~70 s load. The session's connect() will find
             # it in the class-level cache and return immediately.
+            # (handy engine: nothing to warm — the model loads in the handy
+            # CLI's own process per turn, so daemon start stays instant and
+            # there is no 5 GB RSS peak for the OOM killer to pick on.)
             asyncio.create_task(self._warm_vosk(), name="vosk-warm")
         if self.brain.backend == "ollama" and _env_flag_or("OMAVOICE_OLLAMA_WARM", False):
             # Same idea, other organ — but OPT-IN on small-RAM machines:

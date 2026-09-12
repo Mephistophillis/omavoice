@@ -130,6 +130,20 @@ class Config:
     vosk_model: str = field(
         default_factory=lambda: os.environ.get("OMAVOICE_VOSK_MODEL", "vosk-model-small-ru-0.22")
     )
+    # Local STT engine (fork): "handy" buffers each V-hold and transcribes it
+    # as one WAV via the handy CLI (GigaAM v3 on the iGPU — far better Russian
+    # than vosk, and the model never loads into THIS process); "vosk" is the
+    # streaming fallback. handy needs OMAVOICE_PUSH_TO_TALK (boundaries are
+    # exactly the key hold).
+    stt_engine: str = field(
+        default_factory=lambda: os.environ.get("OMAVOICE_STT_ENGINE", "vosk")
+    )
+    handy_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "OMAVOICE_HANDY_MODEL",
+            "handy-computer/gigaam-v3-e2e-rnnt-gguf/gigaam-v3-e2e-rnnt-Q8_0.gguf",
+        )
+    )
 
     # Push-to-talk: the panel's V key opens the mic while held and the turn
     # ends on release — the key, not a silence clock, decides the boundary.

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -109,6 +110,13 @@ class LocalVoiceSession:
         # end it); `flush_now` asks the worker to commit the turn at once —
         # set on key release, checked at the top of the worker loop.
         self._ptt_held_evt = threading.Event()
+        # handy (batch) engine: the whole V-hold is ONE turn — mic PCM is
+        # buffered while held and transcribed as a single WAV on release.
+        # Vosk's streaming machinery (worker/sentinel/silence) stays for the
+        # "vosk" engine; here it is simply never started.
+        self._handy = getattr(cfg, "stt_engine", "vosk") == "handy"
+        self._hold_buf = bytearray()
+        self._turn_tasks: set = set()
 
     @property
     def awaiting_first_turn(self) -> bool:
@@ -128,6 +136,24 @@ class LocalVoiceSession:
         it again — an early version reloaded it per session and the machine
         spent a minute and 3 GB of swap doing nothing else.
         """
+        if self._handy:
+            # The heavy model lives in the handy CLI's own process, loaded
+            # per transcription on the iGPU. Nothing to warm here — that is
+            # the point: the daemon's RSS stays small and there is no
+            # 90 s/5 GB vosk load for the OOM killer to pick on.
+            import shutil
+
+            if not shutil.which("handy"):
+                raise RuntimeError(
+                    "handy binary not found — install handy-bin or set "
+                    "OMAVOICE_STT_ENGINE=vosk"
+                )
+            self._model = True  # sentinel: `connected` is True for handy too
+            self.last_activity = asyncio.get_running_loop().time()
+            self._await_first_turn = True
+            log.info("handy stt ready (model=%s)", self.cfg.handy_model)
+            return
+
         from vosk import Model  # deferred: heavy import
 
         self._recognizer = None
@@ -154,6 +180,8 @@ class LocalVoiceSession:
             self._brain_task.cancel()
         if self._drain_task:
             self._drain_task.cancel()
+        for t in list(self._turn_tasks):
+            t.cancel()
         if self._worker is not None:
             self._audio_q.put_nowait(None)
             self._worker = None
@@ -173,21 +201,39 @@ class LocalVoiceSession:
         itself is NOT reset here — that would race the worker thread; a fresh
         turn starts clean because the previous one was flushed on its release.
         """
+        if self._handy:
+            # A fresh hold discards whatever a lost release left behind.
+            self._hold_buf.clear()
         self._ptt_held_evt.set()
 
     def end_utterance(self) -> None:
         """V released: commit the turn now, not when silence would have.
 
-        Vosk commits a final only after its own ~0.5 s internal silence
-        window — but the daemon closes the mic gate the instant the key goes
-        up, so the real audio stream just stops and that window never
-        arrives: the last clause would live on as a low-quality partial
-        forever. So ~0.7 s of synthesized silence is queued for the
+        handy engine: the buffered hold IS the utterance — boundaries are
+        exactly the key, no endpointing to guess. The buffer is snapshotted
+        as bytes before any new hold can touch it, and transcription runs as
+        a task so the IPC reply (and the next key press) are not blocked on
+        the ~5 s the CLI takes.
+
+        Vosk engine: vosk commits a final only after its own ~0.5 s internal
+        silence window — but the daemon closes the mic gate the instant the
+        key goes up, so the real audio stream just stops and that window
+        never arrives: the last clause would live on as a low-quality
+        partial forever. So ~0.7 s of synthesized silence is queued for the
         recognizer to commit properly, followed by a sentinel; when the
         worker pops the sentinel it commits whatever accumulated as one turn.
         FIFO order makes this deterministic — no clock, no counting.
         """
         self._ptt_held_evt.clear()
+        if self._handy:
+            buf = bytes(self._hold_buf)
+            self._hold_buf.clear()
+            if buf:
+                task = asyncio.get_running_loop().create_task(
+                    self._handy_turn(buf))
+                self._turn_tasks.add(task)
+                task.add_done_callback(self._turn_tasks.discard)
+            return
         chunk = bytes(int(self.cfg.sample_rate * self.cfg.channels * 2 * 0.02))
         for _ in range(35):  # 35 x 20 ms = 0.7 s of digital silence
             self._audio_q.put_nowait(chunk)
@@ -198,6 +244,12 @@ class LocalVoiceSession:
     async def send_audio(self, pcm: bytes) -> None:
         """Queue mic PCM16 for vosk. Called from the daemon's mic loop."""
         if self._closed or self._model is None:
+            return
+        if self._handy:
+            # Only audio captured while V is held belongs to a turn; the
+            # daemon's mic pump already gates everything else away.
+            if self._ptt_held_evt.is_set():
+                self._hold_buf.extend(pcm)
             return
         if self._worker is None:
             self._start_worker()
@@ -552,6 +604,70 @@ class LocalVoiceSession:
             await self.on_audio(data)
             # keep the "still working" signal alive for the daemon watchdog
             self.last_activity = loop.time()
+
+    # -- handy batch transcription --------------------------------------------
+
+    async def _handy_turn(self, pcm: bytes) -> None:
+        """One V-hold as one turn: WAV -> handy CLI -> the conversation loop.
+
+        Runs as a task (see end_utterance) so a ~5 s transcription never
+        blocks the IPC reply or the next key press. The subprocess is
+        killed on cancel (session closed), and a short hold (<0.35 s) is
+        ignored — a stray tap is not a turn.
+        """
+        import wave
+        import tempfile
+
+        if self._closed:
+            return
+        rate = self.cfg.sample_rate
+        if len(pcm) < int(rate * 0.35) * 2:  # sub-0.35 s: key chatter, skip
+            return
+        self.last_activity = asyncio.get_running_loop().time()
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav", prefix="omavoice-", delete=False
+        ) as tmp:
+            path = tmp.name
+        try:
+            def _write() -> None:
+                with wave.open(path, "wb") as w:
+                    vosk_ch = self.cfg.channels
+                    w.setnchannels(vosk_ch)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(pcm)
+
+            await asyncio.to_thread(_write)
+            log.info("handy: transcribing %.1fs of speech",
+                     len(pcm) / (rate * self.cfg.channels * 2))
+            proc = await asyncio.create_subprocess_exec(
+                "handy", "--transcribe-file", path,
+                "--model", self.cfg.handy_model, "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                out, _ = await proc.communicate()
+            except asyncio.CancelledError:
+                proc.kill()
+                raise
+            text = ""
+            for ln in (out or b"").decode(errors="replace").splitlines():
+                ln = ln.strip()
+                if ln.startswith("{"):
+                    try:
+                        text = json.loads(ln).get("text", "") or ""
+                    except ValueError:
+                        pass
+            log.info("turn: %s", text[:160] if text else "(empty)")
+            if text and not self._closed:
+                self.last_activity = asyncio.get_running_loop().time()
+                task = asyncio.ensure_future(self._on_final(text))
+                self._turn_tasks.add(task)
+                task.add_done_callback(self._turn_tasks.discard)
+        finally:
+            with contextlib_suppress():
+                os.unlink(path)
 
     # -- controls -------------------------------------------------------------
 
