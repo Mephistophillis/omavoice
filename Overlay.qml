@@ -453,6 +453,8 @@ Item {
           Text {
             id: hint
             width: parent.width
+            anchors.top: parent.top
+            anchors.left: parent.left
             text: client.connected
               ? "Esc — background · I — interrupt · N — new · Q — stop"
               : "Start the daemon:  systemctl --user start omavoice"
@@ -470,6 +472,9 @@ Item {
           Text {
             id: capsLine
             width: parent.width
+            anchors.top: hint.bottom
+            anchors.topMargin: Style.spacing.xs
+            anchors.left: parent.left
             visible: client.connected
             text: {
               const parts = []

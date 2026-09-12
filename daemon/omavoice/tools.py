@@ -542,6 +542,9 @@ async def _web_answer(payload: dict) -> str:
     return "веб-поиск ничего не дал; переформулируйте или попросите открыть поиск в браузере"
 
 
+def groq_tools() -> list[dict]:
+    return _GROQ_TOOLS
+
 
 def lookup(name: str) -> Tool | None:
     return _INSTANT.get(name) or _CONFIRM.get(name)
