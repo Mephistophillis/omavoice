@@ -116,6 +116,7 @@ Item {
     function state(): string { return client.voiceState }
     function backend(): string { return client.backend }
     function confirmPending(): bool { return client.confirmRequest !== null }
+    function opened(): bool { return root.opened }
     function confirmTest(): void {
       client.confirmRequest = {
         id: 9999, prompt: "Тест диалога: видишь меня?",
