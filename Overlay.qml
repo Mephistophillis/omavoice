@@ -59,6 +59,7 @@ Item {
   }
 
   readonly property string statusText: {
+    if (flashTimer.running) return "Прервано"
     if (client.errorText) return client.errorText
     if (!client.connected) return "Daemon not running"
     switch (client.voiceState) {
@@ -84,6 +85,10 @@ Item {
   readonly property int waitedSeconds: client.pendingSince > 0
     ? Math.max(0, Math.round((root.now - client.pendingSince) / 1000))
     : 0
+
+  // I pressed: acknowledge it for a moment. A key that does nothing visible
+  // reads as broken, even when the daemon already did the right thing.
+  Timer { id: flashTimer; interval: 1200; repeat: false }
 
   function open(payloadJson) {
     root.opened = true
@@ -290,6 +295,7 @@ Item {
             event.accepted = true
           } else if (isKey(event, Qt.Key_I, 23, "ш")) {
             client.cancel()
+            flashTimer.restart()
             event.accepted = true
           } else if (isKey(event, Qt.Key_Q, 16, "й")) {
             root.endSession()
