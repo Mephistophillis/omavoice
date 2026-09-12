@@ -194,6 +194,14 @@ Item {
           return false
         }
         Keys.onPressed: function (event) {
+          // Auto-repeat must never reach push-to-talk: a held V that emits
+          // synthetic press/release pairs commits the turn over and over, and
+          // a whole phrase arrives as one-word fragments ("по", "то"). The
+          // first press is the hold; repeats are noise.
+          if (event.isAutoRepeat) {
+            if (isKey(event, Qt.Key_V, 47, "м")) event.accepted = true
+            return
+          }
           if (event.key === Qt.Key_Escape) {
             root.dismiss()
             event.accepted = true
@@ -219,10 +227,23 @@ Item {
           }
         }
         Keys.onReleased: function (event) {
+          if (event.isAutoRepeat) {
+            if (isKey(event, Qt.Key_V, 47, "м")) event.accepted = true
+            return
+          }
           if (isKey(event, Qt.Key_V, 47, "м") && client.pttHeld) {
             client.pttHeld = false
             client.setPtt(false)
             event.accepted = true
+          }
+        }
+        // Losing focus (another window stolen, panel closing) must release a
+        // held V: a release that never arrives leaves the mic open and the
+        // turn uncommitted — the daemon listens to the room forever.
+        onActiveFocusChanged: {
+          if (!activeFocus && client.pttHeld) {
+            client.pttHeld = false
+            client.setPtt(false)
           }
         }
 
@@ -351,7 +372,32 @@ Item {
             width: scroller.width
             spacing: Style.spacing.panelGap
 
+            // What the ears heard, above the answer: the transcription is the
+            // half of the conversation that can silently go wrong (a missed
+            // word is executed as a real query), so it gets its own line at
+            // the top rather than being mixed into the waterfall below.
             Text {
+              width: parent.width
+              text: client.userText
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              opacity: 0.55
+              visible: text !== ""
+            }
+
+            PanelSeparator {
+              width: parent.width
+              visible: client.userText !== "" && (answerPlain.visible || answerRich.visible)
+            }
+
+            // The answer, once. `assistantText` is what was spoken aloud;
+            // `markdown` is the same answer with links and files attached.
+            // Showing both was a duplicate — pick the richer one.
+            Text {
+              id: answerPlain
               width: parent.width
               text: client.assistantText
               textFormat: Text.PlainText
@@ -359,15 +405,11 @@ Item {
               color: Color.menu.text
               font.family: Style.font.resolvedFamily
               font.pixelSize: Style.font.body
-              visible: text !== ""
-            }
-
-            PanelSeparator {
-              width: parent.width
-              visible: client.markdown !== "" && client.assistantText !== ""
+              visible: text !== "" && client.markdown === ""
             }
 
             Text {
+              id: answerRich
               width: parent.width
               text: {
                 const t = String(client.markdown || "")

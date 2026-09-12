@@ -440,7 +440,18 @@ class Daemon:
             if room_is_loud and not self._allows_voice_interruption():
                 return
             loudness = rms_full_scale(chunk)
-            self.autogain.observe(loudness, True)
+            # Train the gain on speech only, never on held silence. The old
+            # "always speaking" call ramped the gain to its ceiling on room
+            # noise during a quiet hold, and the first second of real speech
+            # — already loud on this microphone — arrived clipped into mush:
+            # the first word of every phrase was lost (measured: raw RMS
+            # ~5000 amplified 14x, "привет" gone, "так" survived). There is
+            # no gate in push-to-talk to deadlock against, so training only
+            # on clearly-voiced chunks is safe here.
+            self.autogain.observe(
+                loudness,
+                loudness >= max(AutoGain.SPEECH_FLOOR, self.gate.opening_level),
+            )
             chunk = self.autogain.apply(chunk)
             self._pending_level = max(self._pending_level, level)
             self._pending_bands = bands
@@ -1313,6 +1324,10 @@ class Daemon:
             # job is saying whether the microphone is hot right now — which
             # in this mode is exactly "is V held", not "is a session live".
             held = message.get("held") is True
+            # Logged because a chattering key (auto-repeat, IME re-delivery)
+            # commits the turn over and over and shreds a phrase into
+            # fragments; the count in the journal is the diagnosis.
+            log.info("ptt: held=%s", held)
             self._ptt_held = held
             session = self.session
             if isinstance(session, LocalVoiceSession):
