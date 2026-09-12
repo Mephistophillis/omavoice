@@ -115,6 +115,16 @@ Item {
     function reset(): void { client.reset() }
     function state(): string { return client.voiceState }
     function backend(): string { return client.backend }
+    function confirmPending(): bool { return client.confirmRequest !== null }
+    function confirmTest(): void {
+      client.confirmRequest = {
+        id: 9999, prompt: "Тест диалога: видишь меня?",
+        title: "open_app {\"target\": \"youtube.com\"}"
+      }
+    }
+    function confirmAnswer(granted: bool): void {
+      if (client.confirmRequest) client.replyConfirm(client.confirmRequest.id, granted === true)
+    }
   }
 
   PanelWindow {
@@ -370,96 +380,6 @@ Item {
           }
         }
 
-        // --- confirm dialog: a tool wants permission -------------------
-        Rectangle {
-          id: confirmCard
-          visible: client.confirmRequest !== null
-          anchors.centerIn: parent
-          width: Math.min(parent.width - Style.space(24), Style.space(420))
-          height: confirmCol.implicitHeight + Style.space(28)
-          radius: Style.cornerRadius
-          color: Color.menu.background
-          border.color: Color.urgent
-          border.width: Style.space(2)
-          opacity: visible ? 1 : 0
-
-          Behavior on opacity { NumberAnimation { duration: 120 } }
-
-          Column {
-            id: confirmCol
-            anchors.top: parent.top
-            anchors.topMargin: Style.space(14)
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(14)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(14)
-            spacing: Style.spacing.sm
-
-            Text {
-              width: parent.width
-              text: client.confirmRequest ? client.confirmRequest.prompt : ""
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: Color.menu.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-            }
-
-            Text {
-              width: parent.width
-              text: client.confirmRequest ? client.confirmRequest.title : ""
-              textFormat: Text.PlainText
-              wrapMode: Text.Wrap
-              color: Color.menu.text
-              font.family: Style.font.resolvedFamily
-              font.pixelSize: Style.font.caption
-              opacity: 0.65
-            }
-
-            Row {
-              spacing: Style.spacing.sm
-
-              Rectangle {
-                width: yesLbl.implicitWidth + Style.space(24)
-                height: yesLbl.implicitHeight + Style.space(12)
-                radius: Style.cornerRadius
-                color: Color.accent
-                MouseArea {
-                  anchors.fill: parent
-                  onClicked: client.replyConfirm(client.confirmRequest.id, true)
-                }
-                Text {
-                  id: yesLbl
-                  anchors.centerIn: parent
-                  text: "Да (Enter)"
-                  color: Color.background
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                }
-              }
-
-              Rectangle {
-                width: noLbl.implicitWidth + Style.space(24)
-                height: noLbl.implicitHeight + Style.space(12)
-                radius: Style.cornerRadius
-                color: Color.menu.border
-                MouseArea {
-                  anchors.fill: parent
-                  onClicked: client.replyConfirm(client.confirmRequest.id, false)
-                }
-                Text {
-                  id: noLbl
-                  anchors.centerIn: parent
-                  text: "Нет (Esc)"
-                  color: Color.menu.text
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                }
-              }
-            }
-          }
-        }
-
         // The answer, scrolling under the head.
         Flickable {
           id: scroller
@@ -561,6 +481,96 @@ Item {
           gradient: Gradient {
             GradientStop { position: 0.0; color: Qt.rgba(fadeBottom.bg.r, fadeBottom.bg.g, fadeBottom.bg.b, 0) }
             GradientStop { position: 1.0; color: fadeBottom.bg }
+          }
+        }
+
+        // --- confirm dialog: a tool wants permission -------------------
+        Rectangle {
+          id: confirmCard
+          visible: client.confirmRequest !== null
+          anchors.centerIn: parent
+          width: Math.min(parent.width - Style.space(24), Style.space(420))
+          height: confirmCol.implicitHeight + Style.space(28)
+          radius: Style.cornerRadius
+          color: Color.menu.background
+          border.color: Color.urgent
+          border.width: Style.space(2)
+          opacity: visible ? 1 : 0
+
+          Behavior on opacity { NumberAnimation { duration: 120 } }
+
+          Column {
+            id: confirmCol
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(14)
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(14)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(14)
+            spacing: Style.spacing.sm
+
+            Text {
+              width: parent.width
+              text: client.confirmRequest ? client.confirmRequest.prompt : ""
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            Text {
+              width: parent.width
+              text: client.confirmRequest ? client.confirmRequest.title : ""
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.menu.text
+              font.family: Style.font.resolvedFamily
+              font.pixelSize: Style.font.caption
+              opacity: 0.65
+            }
+
+            Row {
+              spacing: Style.spacing.sm
+
+              Rectangle {
+                width: yesLbl.implicitWidth + Style.space(24)
+                height: yesLbl.implicitHeight + Style.space(12)
+                radius: Style.cornerRadius
+                color: Color.accent
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: client.replyConfirm(client.confirmRequest.id, true)
+                }
+                Text {
+                  id: yesLbl
+                  anchors.centerIn: parent
+                  text: "Да (Enter)"
+                  color: Color.background
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+              }
+
+              Rectangle {
+                width: noLbl.implicitWidth + Style.space(24)
+                height: noLbl.implicitHeight + Style.space(12)
+                radius: Style.cornerRadius
+                color: Color.menu.border
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: client.replyConfirm(client.confirmRequest.id, false)
+                }
+                Text {
+                  id: noLbl
+                  anchors.centerIn: parent
+                  text: "Нет (Esc)"
+                  color: Color.menu.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+              }
+            }
           }
         }
 
