@@ -654,14 +654,35 @@ class LocalVoiceSession:
             await asyncio.to_thread(_write)
             log.info("handy: transcribing %.1fs of speech",
                      len(pcm) / (rate * self.cfg.channels * 2))
+            # handy links a GUI toolkit even for --transcribe-file: with no
+            # display at all its tao/gtk event loop panics in ~50 ms (rc=101,
+            # empty stdout) and every turn silently reads "(empty)". A daemon
+            # started at boot (enabled unit racing Hyprland's display-env
+            # import) has neither WAYLAND_DISPLAY nor DISPLAY — find the
+            # socket ourselves instead of trusting the start-time environment.
+            env = dict(os.environ)
+            if not env.get("WAYLAND_DISPLAY") and not env.get("DISPLAY"):
+                runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+                try:
+                    sockets = sorted(
+                        n for n in os.listdir(runtime)
+                        if n.startswith("wayland-") and not n.endswith(".lock")
+                    )
+                except OSError:
+                    sockets = []
+                if sockets:
+                    env["WAYLAND_DISPLAY"] = sockets[0]
+                    log.info("handy: no display env; using %s from %s",
+                             sockets[0], runtime)
             proc = await asyncio.create_subprocess_exec(
                 "handy", "--transcribe-file", path,
                 "--model", self.cfg.handy_model, "--json",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             try:
-                out, _ = await proc.communicate()
+                out, err = await proc.communicate()
             except asyncio.CancelledError:
                 proc.kill()
                 raise
@@ -673,6 +694,12 @@ class LocalVoiceSession:
                         text = json.loads(ln).get("text", "") or ""
                     except ValueError:
                         pass
+            if not text and proc.returncode != 0:
+                # A dead handy (GTK panic, bad model id) must not look like
+                # silence: keep the tail of its stderr in the journal.
+                tail = (err or b"").decode(errors="replace").strip().splitlines()
+                log.warning("handy: exited rc=%s: %s", proc.returncode,
+                            " | ".join(tail[-2:]) or "(no stderr)")
             log.info("turn: %s", text[:160] if text else "(empty)")
             if text and not self._closed:
                 self.last_activity = asyncio.get_running_loop().time()
