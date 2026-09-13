@@ -23,6 +23,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 
 import json
 from pathlib import Path
@@ -39,6 +40,7 @@ from .audio import (
     rms_full_scale,
 )
 from .brain import Brain
+from .archive import Archive
 from .config import Config, _env_flag as _env_flag_or
 from .realtime import RealtimeSession
 from .localvoice import LocalVoiceSession
@@ -130,6 +132,14 @@ class Daemon:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.brain = Brain(cfg)
+        self.conversation_id = uuid.uuid4().hex
+        self.request_id = ""
+        self.turns: list[dict] = []
+        # Private per-conversation archive (JSON, 0600). The day-markdown stays
+        # as-is; this is the structured twin the panel's snapshot and archive
+        # listing read from.
+        self.archive = Archive(cfg.state_dir / "conversations")
+        self._lifecycle_lock = asyncio.Lock()
         # Confirm hook: the brain's "confirm" tools call this; it broadcasts a
         # confirm_request and waits (bounded) for the panel's confirm_reply.
         # No panel / timeout / daemon stopping -> False -> tool declined.
@@ -170,7 +180,7 @@ class Daemon:
             return title.split(" ", 1)[0] if title else "?"
 
         self.brain.confirm_hook = _confirm
-        self.server = ipc.Server(cfg.socket_path, self._on_command)
+        self.server = ipc.Server(cfg.socket_path, self._on_command, self.snapshot)
 
         self.speaker = Speaker(cfg, on_level=self._on_output_level)
         self.mic = Microphone(cfg, self._on_input_chunk)
@@ -244,6 +254,13 @@ class Daemon:
         self._pending_level = 0.0
         self._pending_bands = [0.0, 0.0, 0.0, 0.0]
         self._stopping = asyncio.Event()
+
+    def snapshot(self) -> dict:
+        return {"type": "snapshot", "conversation_id": self.conversation_id,
+                "request_id": self.request_id, "state": self.state,
+                "session": self.session is not None, "background": self.backgrounded,
+                "held": self._ptt_held, "turns": list(self.turns),
+                "busy": self.brain.busy}
 
     # -- preferences ----------------------------------------------------------
 
@@ -733,6 +750,10 @@ class Daemon:
         agent worked.
         """
         log.info("brain(%s): %s", self.brain.backend, query)
+        # This question's identity, until reset/cancel clears it. Fresh on
+        # every ask: two asks sharing an id would make the archive's dedup
+        # silently drop the second exchange.
+        self.request_id = uuid.uuid4().hex
         self._emit("agent", query, backend=self.brain.backend)
         started = time.monotonic()
 
@@ -747,8 +768,30 @@ class Daemon:
             files=len(answer.files),
         )
         self.server.broadcast(answer.as_ui_payload())
+        self._remember_turn(query, answer)
         self._archive_turn(query, answer)
         return answer
+
+    def _remember_turn(self, query: str, answer) -> None:
+        """Keep the exchange in the live transcript and the private archive.
+
+        The panel's `turns` and the on-disk conversation are the same list on
+        purpose: a snapshot after a reconnect and the archive listing must
+        never disagree about what was said. Archive failures are logged and
+        swallowed — recording must never take a turn down with it.
+        """
+        turn = {
+            "request_id": self.request_id or uuid.uuid4().hex,
+            "at": time.time(),
+            "query": query,
+            "answer": answer.spoken,
+            "backend": self.brain.backend,
+        }
+        self.turns.append(turn)
+        try:
+            self.archive.append(self.conversation_id, turn)
+        except (OSError, ValueError) as exc:
+            log.warning("conversation archive failed: %s", exc)
 
     def _archive_turn(self, query: str, answer) -> None:
         """Append the exchange to the day's history file.
@@ -1267,7 +1310,7 @@ class Daemon:
             # connection stays up, and with it the conversation. Coming back
             # from a stop to an assistant that remembers nothing is not a stop,
             # it is an erasure, and there is already a key for that.
-            return await self.pause_session()
+            return await self._on_command({"cmd": "reset", "end_session": True})
 
         if command == "background":
             # The panel goes away and nothing else changes. The microphone stays
@@ -1283,9 +1326,14 @@ class Daemon:
             if self.session is None:
                 return {"ok": True, "background": False}
             self.backgrounded = True
-            self._emit("background", "listening in the background")
+            self._ptt_held = False
+            if isinstance(self.session, LocalVoiceSession):
+                self.session._ptt_held_evt.clear()
+                self.session._hold_buf.clear()
+            await self.mic.stop()
+            self._emit("background", "microphone closed; answer may finish")
             self.server.broadcast({"type": "background", "background": True})
-            return {"ok": True, "background": True}
+            return {"ok": True, "background": True, "snapshot": self.snapshot()}
 
         if command == "foreground":
             if self.session is None:
@@ -1312,23 +1360,43 @@ class Daemon:
             # The Realtime API offers no "clear history" event — items can only
             # be deleted one by one, by id — so the honest way to drop it is to
             # reconnect. That costs a second or two and is unambiguous.
-            self.brain.reset()
-            self.server.forget("answer", "transcript", "error", "query")
-            self.server.broadcast({"type": "reset"})
-
-            was_live = self.session is not None
-            if was_live:
-                await self.stop_session(keep_audio=True)
-                result = await self.start_session()
-                if not result.get("ok"):
-                    return result
-            self._emit("reset", "new conversation")
-            return {"ok": True, "restarted": was_live}
+            async with self._lifecycle_lock:
+                self.request_id = ""
+                await self.brain.cancel()
+                was_live = self.session is not None
+                await self.stop_session()
+                self.brain.reset()
+                self.conversation_id = uuid.uuid4().hex
+                self.turns = []
+                self.server.forget("answer", "transcript", "error", "query", "event")
+                # The reset has already happened — memory, context, waterfall.
+                # Say so before attempting the restart: an early return here
+                # used to leave every panel displaying a conversation that no
+                # longer exists anywhere but on its screen.
+                self.server.broadcast({"type": "reset"})
+                snapshot = self.snapshot()
+                self.server.broadcast(snapshot)
+                restarted = False
+                if was_live and not message.get("end_session"):
+                    result = await self.start_session()
+                    restarted = bool(result.get("ok"))
+                    if not restarted:
+                        log.warning("reset could not restart the session: %s",
+                                    result.get("error"))
+                return {"ok": bool(message.get("end_session")) or not was_live or restarted,
+                        "conversation_id": self.conversation_id,
+                        "snapshot": snapshot, "restarted": restarted}
 
         if command == "history":
             # The panel's H view: the tail of today's (or the last day with
-            # anything in it) archived conversation.
-            return {"ok": True, "text": self._history_tail(60)}
+            # anything in it) archived conversation, plus the private archive's
+            # conversation list for the same view.
+            try:
+                items = self.archive.list()["items"]
+            except (OSError, ValueError) as exc:
+                log.warning("archive listing failed: %s", exc)
+                items = []
+            return {"ok": True, "text": self._history_tail(60), "items": items}
 
         if command == "open_link":
             # A link chip clicked in the panel. Reuses the same allow-list the
@@ -1377,6 +1445,13 @@ class Daemon:
             }
 
         if command == "cancel":
+            # I discards unfinished input too; completed dialogue is retained.
+            local = self.session if isinstance(self.session, LocalVoiceSession) else None
+            cancelled = bool(self._ptt_held or self.brain.busy or self._confirm_future
+                             or self._playback_active() or (local and
+                             (local._turn_tasks or local._final_tasks or local._speaking)))
+            self._ptt_held = False
+            self.request_id = ""
             # Shut the assistant up without ending the conversation.
             await self._flush_playback()
             if self.session:
@@ -1388,7 +1463,11 @@ class Daemon:
             await self.brain.cancel()
             if self.session and not self.paused:
                 self._set_state("listening")
-            return {"ok": True}
+            self.server.broadcast({"type": "ptt", "held": False, "mode": bool(self.cfg.push_to_talk)})
+            self._emit("stop", "interrupted" if cancelled else "nothing to interrupt")
+            snapshot = self.snapshot()
+            self.server.broadcast(snapshot)
+            return {"ok": True, "cancelled": cancelled, "snapshot": snapshot}
 
         if command == "apikey":
             key = str(message.get("value") or "").strip()
@@ -1476,6 +1555,13 @@ class Daemon:
             # omavoice-ctl exercises the brain on its own.
             answer = await self.ask_brain(str(message.get("query") or ""))
             return {"ok": True, "spoken": answer.spoken, **answer.as_ui_payload()}
+
+        if command == "snapshot":
+            # The whole visible conversation in one reply: what a reconnecting
+            # panel needs instead of replaying a tail of broadcasts and hoping.
+            snapshot = self.snapshot()
+            snapshot["ok"] = True
+            return snapshot
 
         if command == "confirm_reply":
             # Answer to a confirm_request the daemon broadcast: the panel's

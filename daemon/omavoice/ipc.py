@@ -38,9 +38,13 @@ class _Client:
 
 
 class Server:
-    def __init__(self, path: Path, on_command: CommandHandler) -> None:
+    def __init__(self, path: Path, on_command: CommandHandler,
+                 snapshot: Callable[[], dict] | None = None) -> None:
         self.path = path
         self.on_command = on_command
+        # Called once per new connection so the first thing a client reads is
+        # an authoritative whole-state snapshot, not a replay of fragments.
+        self._snapshot = snapshot
         self._server: asyncio.Server | None = None
         self._clients: set[_Client] = set()
         # Replayed to every new connection so a panel that opens mid-answer
@@ -103,6 +107,11 @@ class Server:
         # tail of them is worth keeping so a reopened panel has context.
         if kind == "event":
             self._recent_events.append(message)
+        elif kind == "snapshot":
+            # Never stored: every connection is handed a fresh one, and a
+            # replayed stale snapshot would sit ahead of the fresh one in the
+            # reconnect queue.
+            pass
         elif kind and kind not in ("level", "trace"):
             # `trace` joins `level` in not being kept. Both are windows onto
             # something happening right now, and replaying either to a panel
@@ -128,6 +137,18 @@ class Server:
         client = _Client(writer)
         self._clients.add(client)
         log.debug("client connected (%d total)", len(self._clients))
+
+        # The snapshot leads. A client that joins mid-answer otherwise reads
+        # yesterday's replayed fragments before today's truth; leading with
+        # the daemon's own view of right now makes every later line a delta.
+        if self._snapshot is not None:
+            try:
+                snapshot = self._snapshot()
+            except Exception:  # noqa: BLE001 — a broken snapshot must not kill the client
+                log.exception("snapshot for a new client failed")
+            else:
+                with contextlib.suppress(asyncio.QueueFull):
+                    client.queue.put_nowait((json.dumps(snapshot, ensure_ascii=False) + "\n").encode())
 
         for message in list(self._latest.values()) + list(self._recent_events):
             with contextlib.suppress(asyncio.QueueFull):

@@ -187,6 +187,7 @@ class LocalVoiceSession:
 
     async def close(self) -> None:
         self._closed = True
+        await self.cancel_response()
         self._abort_play.set()
         if self._brain_task and not self._brain_task.done():
             self._brain_task.cancel()
@@ -715,8 +716,16 @@ class LocalVoiceSession:
     async def cancel_response(self) -> None:
         """Stop the answer in flight — the person started talking over it."""
         self._abort_play.set()
-        if self._brain_task and not self._brain_task.done():
-            self._brain_task.cancel()
+        self._ptt_held_evt.clear()
+        self._hold_buf.clear()
+        tasks = set(self._turn_tasks) | set(self._final_tasks)
+        if self._brain_task:
+            tasks.add(self._brain_task)
+        tasks.discard(asyncio.current_task())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def cancel_tools(self) -> None:
         await self.cancel_response()

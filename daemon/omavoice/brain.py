@@ -566,6 +566,7 @@ class Brain:
         self._ollama_history: list[dict] = [{"role": "system", "content": _OLLAMA_SYSTEM}]
         self._groq_history: list[dict] = [{"role": "system", "content": _GROQ_SYSTEM}]
         self._lock = asyncio.Lock()
+        self._ask_task: asyncio.Task | None = None
         self._on_trace: "Callable[[str], None] | None" = None
 
     # -- lifecycle ----------------------------------------------------------
@@ -689,6 +690,11 @@ class Brain:
         It does not clear `_job`: the asking task owns that, and will reap
         again on its way out — which by then costs one signal to a dead group.
         """
+        task = self._ask_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         job = self._job
         if job is not None:
             await _reap(job)
@@ -736,6 +742,9 @@ class Brain:
             return Answer.error("I am still working on the last question. "
                                 "Ask me again when I have answered that one.")
         async with self._lock:
+            self._ask_task = asyncio.current_task()
+            histories = {name: list(getattr(self, name)) for name in
+                         ('_groq_history', '_hermes_history', '_ollama_history')}
             try:
                 if self.backend == "codex":
                     return await self._ask_codex(query)
@@ -746,6 +755,12 @@ class Brain:
                 if self.backend == "groq":
                     return await self._ask_groq(query)
                 return await self._ask_claude(query)
+            except asyncio.CancelledError:
+                for name, history in histories.items():
+                    setattr(self, name, history)
+                # Remote CLI sessions may contain an incomplete tool exchange.
+                self._threads.clear()
+                raise
             except asyncio.TimeoutError:
                 # `_run` has already ended the group by the time this is
                 # reached; this is the sentence, not the cleanup.
@@ -753,6 +768,8 @@ class Brain:
             except Exception as exc:  # noqa: BLE001 - a dead brain must not kill the voice
                 log.exception("brain failed")
                 return Answer.error(f"The agent failed: {exc}")
+            finally:
+                self._ask_task = None
 
     # -- backends -----------------------------------------------------------
 
